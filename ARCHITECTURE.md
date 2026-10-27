@@ -63,7 +63,7 @@ Benefits:
 
 Cost:
 
-- Extra disk I/O and one JPEG generation.
+- One extra lossy H.264 generation (raw CRF, then export CRF).
 - The raw session is not a standard format; `acquire/session.py` defines it.
 
 ## 3. Component map
@@ -75,7 +75,7 @@ src/dvrk_lerobot/
 │   ├── model.py               frozen dataclasses
 │   └── loader.py              YAML parsing and validation
 ├── acquire/
-│   ├── camera.py              V4L2 capture thread + JPEG writer
+│   ├── camera.py              V4L2 capture thread + live H.264 encoder
 │   ├── metadata.py            session naming, meta.json, camera checks
 │   ├── node.py                ROS 2 subscriptions and callbacks
 │   ├── recorder.py            warm-up and capture loop
@@ -114,26 +114,44 @@ During `record`:
 
 ```text
 main thread
-├── rclpy.spin_once() in a loop
-├── camera thread: left  -> read() -> JPEG -> frames/left/<ns>.jpg
-├── camera thread: right -> read() -> JPEG -> frames/right/<ns>.jpg
-└── ROS subscriptions -> RecorderNode -> RawSession.add_robot()
+├── preview window (cv2.imshow, both eyes) + key poll (window or terminal)
+├── s = begin episode, e = end episode, q = quit
+├── ROS spin thread: SingleThreadedExecutor.spin()
+├── camera thread: left  -> read() -> [episode active] ffmpeg stdin -> video/left.mkv
+├── camera thread: right -> read() -> [episode active] ffmpeg stdin -> video/right.mkv
+└── ROS subscriptions -> RecorderNode -> RawSession.add_robot() [episode active]
 ```
 
-- The ROS executor runs in the **main thread** (`spin_once`), so all
-  subscription callbacks are serialised. `RawSession.add_robot()` therefore
-  does not need a lock.
-- Each camera owns one thread and one `cv2.VideoCapture`. JPEG writes happen in
-  that camera thread; they never block the ROS callbacks.
+- Robot topics and cameras stay open for the whole run. Camera threads read
+  continuously and discard frames between episodes, so the V4L2 queue never
+  holds stale frames and the first frame of an episode has a correct timestamp.
+- `s` creates a new raw session, attaches it to the ROS node, then attaches an
+  encoder to each camera (`Camera.begin`). `e` detaches both cameras at once
+  (`Camera.detach`), flushes the encoders (`Camera.end`), then detaches the
+  node. Robot logging therefore brackets the video on both ends.
+- Quitting during an episode (`q`, Ctrl+C, SIGTERM) finalises it as `aborted`;
+  a camera or encoder error finalises it as `failed`.
+
+- The ROS executor spins on its own thread, so drawing the preview never delays
+  robot callbacks (about 600 messages/s for two arms). Callbacks are serialised
+  by the single-threaded executor; `RecorderNode.attach()` swaps the active
+  session under a lock, so an episode is never closed while a callback writes.
+- HighGUI (`cv2.imshow` / `cv2.waitKey`) is only used from the main thread. The
+  preview shows each camera's latest frame, scaled to 480 px high.
+- Each camera owns one thread, one `cv2.VideoCapture`, and one `ffmpeg`
+  subprocess (libx264 `veryfast`). Raw BGR frames are piped to ffmpeg from
+  that thread; encoding runs in the ffmpeg process and never blocks the ROS
+  callbacks.
 - The main loop polls `camera.check()` and stops if a camera thread failed.
 - `stop` is a `threading.Event` shared by the camera threads and the signal
   handler.
 - Camera threads are daemon threads, but `Camera.stop()` joins them for up to
-  five seconds before releasing the device.
+  60 seconds before releasing the device.
 - `SIGTERM` sets the stop event; `Ctrl+C` raises `KeyboardInterrupt` in the
-  main thread. Both paths reach the `finally` block that finalises the session.
+  main thread. Both paths reach the `finally` block that finalises any active
+  episode.
 
-During `export` there is a single process and a single thread. Each camera side
+During `convert` there is a single process and a single thread. Each camera side
 is encoded sequentially to avoid competing ffmpeg processes.
 
 ```mermaid
@@ -145,18 +163,20 @@ sequenceDiagram
 
     M->>N: wait for measured_js + measured_cp
     M->>C: open devices and validate one frame
-    M->>S: create session + meta.json
-    M->>C: start(stop_event)
-    loop until duration or Ctrl+C
-        N->>S: add_robot(jp/cp, header_stamp)
-        C->>C: read frame, time.time_ns(), write JPEG
+    M->>C: start(stop_event): continuous read, frames discarded
+    loop each episode: key 's' ... key 'e'
+        M->>S: create session + meta.json
+        M->>C: begin(video, timestamps)
+        N->>S: add_robot(jp/jaw/cp, header_stamp)
+        C->>C: read frame, time.time_ns(), pipe to ffmpeg, append timestamp
+        M->>C: detach(), end(): flush encoder
+        M->>S: finalize(status, counts, joint_names)
     end
-    M->>C: stop() and join()
-    M->>S: finalize(status, counts, joint_names)
+    M->>C: stop() and join() on 'q' or Ctrl+C
 ```
 
-The cameras write JPEG files directly; the `RawSession` arrow is conceptual for
-the frame timestamps and counts.
+The cameras write their videos and timestamp files directly; the `RawSession`
+arrow is conceptual for the frame timestamps and counts.
 
 ## 5. Clocks and timestamps
 
@@ -192,7 +212,7 @@ exporter records the median joint/pose header skew in the alignment notes.
 LeRobot requires a fixed-fps timeline. If raw capture is slightly irregular,
 writing raw timestamps would fail LeRobot's timestamp check and make frame
 indexing ambiguous. The exporter instead writes `k / fps` and keeps the true
-capture times in the raw JPEG filenames. The alignment notes warn when the raw
+capture times in the raw `*_timestamps.txt` files. The alignment notes warn when the raw
 capture span differs from the nominal span by more than 10%.
 
 ## 6. Raw session format
@@ -200,16 +220,25 @@ capture span differs from the nominal span by more than 10%.
 A raw session is a directory:
 
 ```text
-<root>/<session_id>/
+<root>/<run datetime>/episode_<N>/
 ├── meta.json
 ├── robot.jsonl
-└── frames/
-    ├── left/<capture_ns>.jpg
-    └── right/<capture_ns>.jpg
+└── video/
+    ├── left.mkv                # H.264, every captured frame in order
+    ├── left_timestamps.txt     # one capture time (ns) per line; line i = frame i
+    ├── right.mkv
+    └── right_timestamps.txt
 ```
 
-`session_id` is `YYYYmmdd-HHMMSS_<task-slug>`. If a directory already exists,
-the recorder appends `-1`, `-2`, and so on.
+MKV is used because it stays readable if the recorder is killed. On load, the
+timestamp list is truncated to the number of encoded frames, so a crash only
+loses the frames still inside the encoder.
+
+One `record` run creates `<root>/YYYYmmdd-HHMMSS/` at its first episode and
+numbers episodes `episode_1`, `episode_2`, ... in start order (aborted episodes
+keep their number). `session_id` in `meta.json` is `<run>/<episode>`. Export
+accepts run directories and expands them in numeric episode order (so
+`episode_10` follows `episode_9`).
 
 ### `meta.json`
 
@@ -217,27 +246,27 @@ Written initially and rewritten atomically at finalisation:
 
 ```json
 {
-  "format": "dvrk-raw-v1",
-  "session_id": "20261027-140000_needle-transfer",
+  "format": "dvrk-raw-v2",
+  "session_id": "20261027-140000/episode_1",
   "created_ns": 1761544800000000000,
   "ended_ns": 1761544860000000000,
   "task": "needle transfer",
-  "operator": "zhang",
   "notes": "",
   "fps": 30,
   "clock": "system",
   "status": "ok",
   "arms": [
-    {"name": "PSM1", "js_topic": "/PSM1/measured_js", "cp_topic": "/PSM1/measured_cp"}
+    {"name": "PSM1", "js_topic": "/PSM1/measured_js", "cp_topic": "/PSM1/measured_cp",
+     "jaw_topic": "/PSM1/jaw/measured_js"}
   ],
   "cameras": {
-    "left": {"device": "/dev/video0", "width": 1280, "height": 1024, "fps": 30,
-             "fourcc": "MJPG", "jpeg_quality": 95, "negotiated": {}},
-    "right": {"device": "/dev/video2", "width": 1280, "height": 1024, "fps": 30,
-              "fourcc": "MJPG", "jpeg_quality": 95, "negotiated": {}}
+    "left": {"device": "/dev/video0", "width": 1920, "height": 1080, "fps": 30,
+             "fourcc": "MJPG", "crf": 18, "negotiated": {}},
+    "right": {"device": "/dev/video2", "width": 1920, "height": 1080, "fps": 30,
+              "fourcc": "MJPG", "crf": 18, "negotiated": {}}
   },
   "frame_counts": {"left": 1800, "right": 1800},
-  "robot_counts": {"jp": 6000, "cp": 3000},
+  "robot_counts": {"jp": 6000, "jaw": 6000, "cp": 6000},
   "joint_names": {"PSM1": ["PSM1_1_joint", "..."]},
   "frame_ids": {"PSM1": "PSM1_base"}
 }
@@ -259,7 +288,7 @@ One JSON object per ROS message:
 Messages are appended in callback order. The loader validates:
 
 - JSON shape and numeric types;
-- `kind` is `jp` or `cp`;
+- `kind` is `jp`, `jaw`, or `cp`;
 - `arm` is present in `meta.json`;
 - frame timestamps are strictly increasing and filenames are integers.
 
@@ -277,7 +306,7 @@ independently selects the nearest sample for each output frame.
 
 Given a raw session:
 
-1. Build sorted `(stamp, values)` series for every `(arm, jp)` and `(arm, cp)`.
+1. Build sorted `(stamp, values)` series for every `(arm, jp)`, `(arm, jaw)`, and `(arm, cp)`.
    Duplicate stamps collapse to the first sample.
 2. Pair frames:
 
@@ -295,8 +324,8 @@ for each left frame L:
 Left is the master. Each right frame is used at most once.
 
 3. For each pair, compute `t = (L.ts + R.ts) // 2`.
-4. For each arm, find the nearest `jp` and `cp` timestamps to `t` within
-   `robot_tolerance_ms`. If either is missing, drop the pair and count it.
+4. For each arm, find the nearest `jp`, `jaw`, and `cp` timestamps to `t` within
+   `robot_tolerance_ms`. If any is missing, drop the pair and count it.
 5. Concatenate the selected values in configuration order to form the state.
 6. Set `timestamp[k] = k / fps`.
 7. Set `action[t] = state[t + 1]`, with the final action repeated.
@@ -310,8 +339,9 @@ Episode(
     state=np.ndarray,       # (N, D), float32
     action=np.ndarray,      # (N, D), float32
     timestamps=np.ndarray,  # (N,), float32, k/fps
-    left=list[Path],        # N JPEG paths
-    right=list[Path],       # N JPEG paths
+    videos=dict[str, Path], # raw left/right MKV
+    left=list[int],         # N frame indices into videos["left"]
+    right=list[int],        # N frame indices into videos["right"]
     state_names=list[str],  # D names
     notes=list[str],
 )
@@ -323,8 +353,10 @@ For arms `A1, A2, ...`:
 
 ```text
 A1.jp.<joint name 0> ... A1.jp.<joint name n>
+A1.jaw
 A1.cp.x, A1.cp.y, A1.cp.z, A1.cp.qx, A1.cp.qy, A1.cp.qz, A1.cp.qw
 A2.jp....
+A2.jaw
 A2.cp....
 ```
 
@@ -369,14 +401,14 @@ comes from the first-seen task string.
 Each episode is encoded independently:
 
 ```text
-ffmpeg -framerate <fps> -i <symlinked sequential JPEGs> \
+<raw MKV, selected frames decoded by OpenCV> | ffmpeg -f rawvideo -i - \
        -c:v libx264 -preset <preset> -crf <crf> \
        -pix_fmt yuv420p -movflags +faststart \
        videos/.../episode_XXXXXX.mp4
 ```
 
-The input frames are symlinked into a temporary directory with six-digit
-names, so no copies are made. After encoding, `ffprobe` supplies the actual
+The raw video is decoded sequentially and only the aligned frame indices are
+piped to the encoder, so frames dropped by alignment are skipped. After encoding, `ffprobe` supplies the actual
 dimensions, codec, pixel format, and frame rate. The feature schema uses those
 probed values.
 
@@ -429,7 +461,8 @@ user directory.
 ### Alignment invariants
 
 - At least two stereo pairs are required.
-- Every pair must have `jp` and `cp` for every configured arm.
+- Every pair must have `jp`, `jaw`, and `cp` for every configured arm.
+- `jaw/measured_js` must have exactly one value.
 - `measured_cp` must have exactly seven values.
 - State values must be finite.
 - All episodes must share the same state names and dimension.
@@ -461,18 +494,16 @@ user directory.
 
 ### Acquisition
 
-At 1280x1024, JPEG quality 95:
+Measured on the lab machine (UGREEN capture cards, 1920x1080, libx264
+`veryfast`, CRF 18):
 
-- One JPEG is roughly 100-400 KB depending on scene texture.
-- Stereo at 30 fps is roughly 6-24 MB/s.
-- One hour is roughly 20-85 GB.
-- `cv2.imwrite` on a modern CPU is a few milliseconds; two threads are
-  sufficient for 30 fps, but very high resolutions or slow disks can drop
-  frames.
+- About 9 MB/s per eye (about 65 GB per hour for stereo), versus about
+  23 MB/s per eye for JPEG quality 95. CRF 23 is roughly 2.5x smaller again.
+- Each ffmpeg encoder uses about 1.7 CPU cores; both eyes sustain 30 fps.
 
-The recorder does not buffer frames in memory. Each frame is written before the
-next `read()` in that camera thread, which applies natural back-pressure. If the
-disk cannot keep up, the V4L2 driver drops frames and the exporter's span check
+The recorder does not buffer frames in memory. Each frame is piped to ffmpeg
+before the next `read()`, which applies natural back-pressure. If the encoder
+cannot keep up, the V4L2 driver drops frames and the exporter's span check
 reports the mismatch.
 
 ### Export
@@ -524,9 +555,9 @@ distinction between measured and commanded motion.
 
 ### Lossless intermediates
 
-Replace the JPEG writer in `acquire/camera.py` with PNG or FFV1. The aligner only
-needs a list of frame paths; the video encoder accepts any image extension if
-the temporary symlink pattern is adjusted.
+Use `-crf 0` (lossless H.264) or switch the codec in `dataset/video.py:start_encoder`
+to FFV1. The aligner only needs frame indices and timestamps, so nothing else
+changes.
 
 ### Hardware trigger
 
@@ -564,15 +595,19 @@ Rosbag2 would preserve the full graph, but:
 The raw session is a purpose-built, minimal analogue. Rosbag2 can be added in
 parallel when full replay is needed.
 
-### Online H.264 encoding during acquisition
+### Per-frame JPEG files during acquisition
 
-Rejected for the first version because:
+Used in the first version, then replaced by live H.264 because 1080p stereo
+JPEGs cost about 160 GB per hour. The original concerns about online encoding
+are handled as follows:
 
-- Two encoders compete with capture and ROS callbacks.
-- Timestamp-to-frame mapping becomes harder to audit.
-- A failed encoder can lose an entire episode.
-
-JPEG intermediates are simpler and keep the raw data recoverable.
+- Encoders run in separate ffmpeg processes; they use about 1.7 cores each on
+  the lab machine and do not slow down capture or the ROS callbacks.
+- Timestamp-to-frame mapping is explicit: line i of `<side>_timestamps.txt` is
+  frame i, and ffmpeg runs with `-vsync passthrough` so it never drops or
+  duplicates frames.
+- MKV survives a killed recorder; only frames still buffered in the encoder are
+  lost.
 
 ## 14. Verification strategy
 

@@ -1,648 +1,482 @@
-# dVRK to LeRobot Dataset v2.1
+# dVRK → LeRobot Dataset v2.1
 
-Record dVRK Cartesian and joint telemetry together with a stereo endoscope stream,
-align the streams in time, and export the result as a
-[LeRobot Dataset v2.1](https://github.com/huggingface/lerobot) directory.
+Collect teleoperation demonstrations on the dVRK and turn them into a
+[LeRobot v2.1](https://github.com/huggingface/lerobot) dataset.
 
-The target platform is Ubuntu 22.04, ROS 2 Humble, a dVRK workspace built at
-`/home/zhang/ros2_ws`, and two V4L2 cameras exposed as `/dev/video0` and
-`/dev/video2`. `uv` 0.9 or newer, Python 3.10, and a system `ffmpeg` with
-`libx264` are required.
+The tool records two things at the same time:
 
-The design is deliberately split into two stages:
+- **Robot telemetry** from ROS 2: joint positions, jaw angle and Cartesian pose
+  of each PSM (about 100 Hz per topic).
+- **Stereo endoscope video** from two V4L2 capture devices (1920x1080, 30 fps).
 
-1. **Acquire** raw robot samples and timestamped stereo JPEGs. This stage only
-   needs ROS 2 and OpenCV.
-2. **Export** the raw session(s) into LeRobot v2.1 parquet, MP4, and metadata.
-   This stage does not need ROS 2 and can be re-run with different tolerances.
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed design, timing model,
-and design trade-offs.
-
----
-
-## 1. What is recorded
-
-For each configured arm (default `PSM1`):
-
-| Source | ROS 2 topic | Message | Stored as |
-|---|---|---|---|
-| Joint state | `/PSM1/measured_js` | `sensor_msgs/msg/JointState` | `measured_js.position` |
-| Cartesian pose | `/PSM1/measured_cp` | `geometry_msgs/msg/PoseStamped` | position + quaternion `xyzw` |
-| Left eye | `/dev/video0` | V4L2 | JPEG, timestamped filename |
-| Right eye | `/dev/video2` | V4L2 | JPEG, timestamped filename |
-
-`measured_jp` is **not** a dVRK topic. In CRTK and `dvrk_python`,
-`measured_jp()` is a client-side accessor that returns the `position` field of
-`measured_js`. The recorder subscribes to `measured_js` and stores its
-`position` array; no separate `/measured_jp` subscription exists.
-
-The exporter produces an `observation.state` vector with this order:
+It then aligns both streams in time and writes them in the LeRobot format.
 
 ```text
-PSM1.jp.<joint 0> ... PSM1.jp.<joint n>
-PSM1.cp.x PSM1.cp.y PSM1.cp.z PSM1.cp.qx PSM1.cp.qy PSM1.cp.qz PSM1.cp.qw
+                ┌──────────────────────────┐        ┌────────────────────────────┐
+ dVRK (ROS 2) ─►│ record                   │        │ convert                    │
+ endoscope    ─►│ s / e / q, live preview  │──raw──►│ align in time, write       │──► LeRobot v2.1
+                │ data/raw/<run>/episode_N │        │ data/lerobot/<dataset>     │
+                └──────────────────────────┘        └────────────────────────────┘
+                 needs the robot                      offline, repeatable
 ```
 
-For multiple arms, the same block is repeated in the order listed in
-`configs/record.yaml`. Units and frames are whatever the dVRK publishes
-(normally metres, radians, and the `header.frame_id` of `measured_cp`).
+| Step | Command | What it does |
+|---|---|---|
+| Check | `./scripts/doctor.sh` | Verifies ffmpeg, both cameras and all robot topics |
+| Record | `./scripts/record.sh --task "..."` | Records episodes with a preview window; `s` start, `e` end, `q` quit |
+| Convert | `./scripts/convert.sh --sessions ... --output ...` | Aligns robot data and video in time, writes the LeRobot dataset |
+| Verify | `uv run --no-sync dvrk-lerobot verify --dataset ...` | Checks the dataset structure |
 
-`action` is currently defined as the next aligned `observation.state`
-(`action[t] = state[t + 1]`; the last action repeats the last state). This makes
-the dataset structurally complete for LeRobot, but it is a placeholder until a
-commanded-action source is selected. See
-[Assumptions and limitations](#12-assumptions-and-limitations).
+Design details (threading, timing model, file formats) are in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
-## 2. Quick start
+## 1. Requirements
 
-```bash
-# 1. System tools (once)
-sudo apt install ffmpeg v4l-utils
-
-# 2. Python environment (once; keeps system ROS packages visible)
-./scripts/setup_env.sh
-
-# 3. ROS environment (every shell; the wrapper scripts do this for you)
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
-# Override ROS_SETUP / DVRK_SETUP if your workspaces live elsewhere.
-
-# 4. Pre-flight: ffmpeg, both cameras, and live topics
-uv run --no-sync dvrk-lerobot doctor -c configs/record.yaml
-
-# 5. Record one episode (Ctrl+C or --duration to stop)
-./scripts/record.sh --task "needle transfer" --operator zhang --duration 60
-
-# 6. Export one or more recordings
-./scripts/export.sh \
-  --sessions data/raw/20261027-140000_needle-transfer \
-  --output data/lerobot/needle_transfer
-
-# 7. Structural check
-uv run --no-sync dvrk-lerobot verify --dataset data/lerobot/needle_transfer
-```
-
-Record several demonstrations by repeating step 5 with different sessions and
-passing all session directories to step 6. Each raw session becomes one
-LeRobot episode.
-
----
-
-## 3. Environment
-
-### 3.1 Why a system-site-packages virtual environment
-
-`rclpy` and the ROS 2 message packages are installed under
-`/opt/ros/humble`, not on PyPI. The project therefore uses a `uv` environment
-created with `--system-site-packages`:
-
-```bash
-uv venv --system-site-packages --python /usr/bin/python3 .venv
-uv sync
-```
-
-This gives the environment access to `rclpy`, `sensor_msgs`, and
-`geometry_msgs`, while `numpy`, `opencv-python-headless`, `pyarrow`, and
-`PyYAML` come from the project lock file. Do **not** create a plain
-`uv venv` for the recorder; `import rclpy` will fail.
-
-`scripts/setup_env.sh` performs these steps and refuses to reuse an existing
-environment that was created without system site packages.
-
-### 3.2 Pinned dependencies
-
-| Package | Purpose |
+| Item | Version / note |
 |---|---|
-| `numpy<2` | array math, compatible with ROS 2 Humble Python 3.10 |
-| `opencv-python-headless` | V4L2 capture and JPEG writing |
-| `pyarrow` | parquet tables |
-| `PyYAML` | acquisition configuration |
-| `pytest`, `ruff` | development only |
+| OS | Ubuntu 22.04 with a desktop session (the preview window needs a display) |
+| ROS 2 | Humble, at `/opt/ros/humble` |
+| dVRK | ROS 2 workspace built at `~/ros2_ws` |
+| Python | 3.10 (the system Python used by ROS Humble) |
+| uv | 0.9 or newer |
+| ffmpeg | System package with `libx264` (`sudo apt install ffmpeg`) |
+| Cameras | Two V4L2 devices: left eye `/dev/video0`, right eye `/dev/video2` |
 
-`ffmpeg` and `ffprobe` are system binaries and are not Python dependencies.
-They are used only during export.
-
-### 3.3 Import check
+## 2. One-time setup
 
 ```bash
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
-uv run --no-sync python -c \
-  "import rclpy, cv2, pyarrow, numpy; print('imports ok', numpy.__version__)"
+sudo apt install ffmpeg
+./scripts/setup_env.sh
 ```
 
-If this fails, check `.venv/pyvenv.cfg` for
-`include-system-site-packages = true`.
+`setup_env.sh` creates `.venv` **with access to the system ROS packages**
+(`--system-site-packages`), so `rclpy` and the ROS message types can be imported,
+and installs `numpy`, `opencv-python` (with GUI), `pyarrow` and `PyYAML` from
+the lock file. Do not create the environment with a plain `uv venv`;
+`import rclpy` would fail.
+
+All scripts source ROS for you:
+
+```bash
+source /opt/ros/humble/setup.bash      # override with ROS_SETUP=...
+source ~/ros2_ws/install/setup.bash    # override with DVRK_SETUP=...
+```
 
 ---
 
-## 4. Repository layout
+## 3. Collecting data, step by step
+
+### 3.1 Start the dVRK
+
+Start the dVRK console as usual, power on, home the arms and enable
+teleoperation. The recorder only listens; it never sends commands.
+
+### 3.2 Pre-flight check
+
+```bash
+./scripts/doctor.sh
+```
+
+Expected output:
 
 ```text
-.
-├── README.md                     # this file
-├── ARCHITECTURE.md               # detailed design and timing model
-├── pyproject.toml                # uv project and tool configuration
-├── uv.lock                       # locked Python dependency graph
-├── configs/
-│   └── record.yaml               # topics, cameras, fps, tolerances
-├── scripts/
-│   ├── setup_env.sh              # create the system-site-packages venv
-│   ├── doctor.sh                 # pre-flight checks
-│   ├── record.sh                 # source ROS 2 + record
-│   └── export.sh                 # export raw sessions
-├── src/dvrk_lerobot/
-│   ├── cli.py                    # argument parsing and command dispatch
-│   ├── config/                   # typed configuration
-│   │   ├── model.py
-│   │   └── loader.py
-│   ├── acquire/                  # ROS 2 + camera acquisition
-│   │   ├── camera.py             # V4L2 capture thread
-│   │   ├── metadata.py           # session naming and metadata
-│   │   ├── node.py               # ROS 2 subscriptions and callbacks
-│   │   ├── recorder.py           # camera/ROS orchestration
-│   │   └── session.py            # raw session writer/reader
-│   ├── align/                    # timestamp alignment
-│   │   └── sync.py
-│   ├── dataset/                  # LeRobot v2.1 writer
-│   │   ├── schema.py             # feature names, paths, info.json
-│   │   ├── stats.py              # numeric and video statistics
-│   │   ├── video.py              # H.264 encoding/probing
-│   │   ├── parquet.py            # per-episode table
-│   │   ├── metadata.py           # meta/*.json and meta/*.jsonl
-│   │   └── writer.py             # export orchestration
-│   └── tools/
-│       ├── doctor.py             # camera/topic/tool checks
-│       └── verify.py             # read-only dataset validation
-└── tests/
-    ├── unit/
-    └── integration/
+== tools ==
+PASS ffmpeg: /usr/bin/ffmpeg
+PASS ffprobe: /usr/bin/ffprobe
+
+== cameras ==
+PASS left: 1920x1080 @ 30.0 fps fourcc='MJPG' (/dev/video0)
+PASS right: 1920x1080 @ 30.0 fps fourcc='MJPG' (/dev/video2)
+
+== ROS 2 topics ==
+listening for 5.0s ...
+PASS /PSM1/measured_js: 496 messages (99.2 Hz)
+       first receive time minus header stamp: 0.4 ms
+PASS /PSM1/jaw/measured_js: 495 messages (99.0 Hz)
+...
+RESULT: PASS
 ```
 
-Each directory has one responsibility. `acquire` is the only package that
-runs ROS 2 subscription callbacks or camera capture; `dataset` is the only
-package that writes LeRobot files.
+Fix any `FAIL` before recording (see [Troubleshooting](#8-troubleshooting)).
+The "receive time minus header stamp" should be a few milliseconds; a value of
+seconds means the robot and the PC clocks disagree.
 
----
-
-## 5. ROS 2 topic contract
-
-Check the live graph before recording:
+### 3.3 Record episodes
 
 ```bash
-ros2 topic list | grep -E 'PSM|ECM|MTM'
-ros2 topic type /PSM1/measured_js
-ros2 topic type /PSM1/measured_cp
-ros2 topic hz /PSM1/measured_js
-ros2 topic hz /PSM1/measured_cp
-ros2 topic info -v /PSM1/measured_js
+./scripts/record.sh --task "needle pick"
 ```
 
-Expected types:
+| Option | Default | Meaning |
+|---|---|---|
+| `--task` | required | Task description stored with every episode of this run (becomes the LeRobot task text) |
+| `--notes` | empty | Free-form notes stored in each episode's `meta.json` |
+| `--root` | `data/raw` | Where run folders are created |
+| `-c / --config` | `configs/record.yaml` | Configuration file |
+
+What happens:
+
+1. The recorder waits (up to 20 s) until every configured robot topic has sent data.
+2. It opens both cameras and shows a **preview window** with both eyes side by side.
+3. You control it with the keyboard, either in the preview window or in the terminal:
+
+| Key | Action |
+|---|---|
+| `s` | Start a new episode (overlay turns red: `REC episode_N  12.3s  370`) |
+| `e` | End the current episode and save it (overlay returns to green `IDLE`) |
+| `q` | Quit. If an episode is running, it is saved with status `aborted` |
+| `Ctrl+C` | Same as `q` (in the terminal) |
+
+Typical session:
 
 ```text
-/PSM1/measured_js   sensor_msgs/msg/JointState
-/PSM1/measured_cp   geometry_msgs/msg/PoseStamped
+[record] waiting for robot topics
+[record] opening cameras
+[record] ready. keys (preview window or terminal): [s] start episode   [e] end episode   [q] quit
+[record] episode_1 started: data/raw/20261027-192407/episode_1
+[record] episode_1 saved (1 this run)
+[record] episode_2 started: data/raw/20261027-192407/episode_2
+[record] episode_2 saved (2 this run)
+recorded 2 episode(s)
+raw session: data/raw/20261027-192407/episode_1
+raw session: data/raw/20261027-192407/episode_2
 ```
 
-Topic names are configured in `configs/record.yaml`; the QoS profile is fixed
-to `qos_profile_sensor_data` (best effort). A best-effort subscriber is
-compatible with both best-effort and reliable publishers, which makes the
-recorder tolerant of the dVRK bridge's QoS choice.
+Tips:
 
-### Timestamps
+- Robot topics and cameras stay open for the whole run, so `s` starts recording
+  immediately. Record as many episodes as you like before pressing `q`.
+- A failed demonstration: press `e` as usual, and simply leave that episode out
+  when converting (or delete its folder).
+- When the preview window has keyboard focus, **every key you type goes to the
+  recorder**. Click another window before typing elsewhere.
+- One run has one `--task`. For a different task, quit and start a new run.
 
-- Camera frames are timestamped with `time.time_ns()` immediately after
-  `VideoCapture.read()` returns.
-- Robot samples keep the ROS header stamp as their alignment time. If the
-  header stamp is zero, the receive time is used and a warning is printed.
-- The exporter aligns camera and robot streams using those integer timestamps.
-- Run with `use_sim_time=false`. If the header stamp differs from the wall
-  clock by more than two seconds, the recorder warns and `doctor` prints the
-  observed offset. Fix the clock source before collecting a real dataset.
+### 3.4 Where the raw data goes
 
-Inspect the stamps directly if needed:
-
-```bash
-ros2 topic echo --once /PSM1/measured_cp --field header.stamp
-date +%s%N
-```
-
----
-
-## 6. Camera setup
-
-List devices and supported modes:
-
-```bash
-v4l2-ctl --list-devices
-v4l2-ctl -d /dev/video0 --list-formats-ext
-v4l2-ctl -d /dev/video2 --list-formats-ext
-```
-
-Default assumptions:
-
-| Side | Device | Mode | Format |
-|---|---|---|---|
-| left | `/dev/video0` | 1280x1024 @ 30 | MJPG |
-| right | `/dev/video2` | 1280x1024 @ 30 | MJPG |
-
-Change `configs/record.yaml` if the devices enumerate differently, if the
-endoscope uses another resolution, or if MJPG is unavailable. The recorder
-fails fast when the negotiated size differs from the request; it does not
-silently resize.
-
-The two devices are treated as independent cameras with software timestamps.
-They are not hardware-triggered. The `alignment.stereo_tolerance_ms` setting
-bounds the accepted left/right skew. For quantitative stereo work, use a
-hardware-synchronised capture path instead.
-
-Both cameras must use the same resolution and rate, and that rate must equal
-`dataset.fps`. This keeps the final MP4 timeline and the LeRobot `fps` field
-consistent.
-
----
-
-## 7. Recording
-
-### 7.1 Configuration
-
-The default file is `configs/record.yaml`:
-
-```yaml
-dataset:
-  fps: 30
-  robot_type: dvrk
-  video_codec: h264
-  video_crf: 18
-  video_preset: medium
-
-arms:
-  - name: PSM1
-    js_topic: /PSM1/measured_js
-    cp_topic: /PSM1/measured_cp
-
-cameras:
-  left:
-    device: /dev/video0
-    width: 1280
-    height: 1024
-    fps: 30
-    fourcc: MJPG
-    jpeg_quality: 95
-  right:
-    device: /dev/video2
-    width: 1280
-    height: 1024
-    fps: 30
-    fourcc: MJPG
-    jpeg_quality: 95
-
-alignment:
-  stereo_tolerance_ms: 15.0
-  robot_tolerance_ms: 25.0
-```
-
-Add a second arm by uncommenting the `PSM2` block. The arm order defines the
-state-vector order and must stay stable for a dataset.
-
-### 7.2 Pre-flight
-
-```bash
-./scripts/doctor.sh -c configs/record.yaml
-```
-
-`doctor` checks:
-
-1. `ffmpeg` and `ffprobe` on `PATH`.
-2. Both V4L2 devices open at the requested size and rate.
-3. Every configured topic produces messages during the listen window.
-
-It prints `PASS`/`FAIL` per check and a final summary. Exit code is non-zero on
-failure. Run it with the dVRK running and no other process holding the cameras.
-
-### 7.3 Start and stop
-
-```bash
-./scripts/record.sh --task "needle transfer" --operator zhang --duration 60
-```
-
-- `--duration 0` (the default) records until `Ctrl+C`.
-- Recording starts only after every configured `measured_js` and
-  `measured_cp` topic has produced at least one valid sample.
-- A session directory is created after warm-up; camera threads start at that
-  moment.
-- `SIGTERM` and `Ctrl+C` stop the threads, flush the robot log, and finalise
-  `meta.json`.
-- If a camera thread fails, the session is marked `failed` and the error is
-  propagated.
-
-### 7.4 Raw session layout
+Each run creates one folder named by the time of its first episode, with one
+sub-folder per episode:
 
 ```text
-data/raw/20261027-140000_needle-transfer/
-├── meta.json                 # task, operator, topics, camera negotiation
-├── robot.jsonl               # one JSON object per measured_js/measured_cp sample
-└── frames/
-    ├── left/
-    │   └── 1761544800123456789.jpg
-    └── right/
-        └── 1761544800123456789.jpg
+data/raw/20261027-192407/              ← one record run
+├── episode_1/
+│   ├── meta.json                      ← task, status, cameras, topics, joint names, counts
+│   ├── robot.jsonl                    ← every robot message, one JSON per line
+│   └── video/
+│       ├── left.mkv                   ← left eye, H.264, every captured frame
+│       ├── left_timestamps.txt        ← capture time (ns) of each frame, line i = frame i
+│       ├── right.mkv
+│       └── right_timestamps.txt
+└── episode_2/
+    └── ...
 ```
 
-Example robot line:
+`meta.json` → `status` tells you how the episode ended:
+
+| Status | Meaning |
+|---|---|
+| `ok` | Ended with `e` |
+| `aborted` | Program quit (`q`, Ctrl+C) while the episode was running |
+| `failed` | A camera or encoder error stopped the episode |
+| `recording` | Program was killed hard; the files are still readable |
+
+A line of `robot.jsonl`:
 
 ```json
-{"t_ns":1761544800123456789,"stamp_ns":1761544800123000000,"kind":"jp","arm":"PSM1","values":[0.1,0.2,0.3,0.4,0.5,0.6,0.7]}
+{"t_ns":1793096647123456789,"stamp_ns":1793096647123000000,"kind":"jp","arm":"PSM1","values":[0.1,0.2,0.3,0.4,0.5,0.6]}
 ```
 
-`t_ns` is the receive time, `stamp_ns` is the header stamp, `kind` is `jp` or
-`cp`, and `values` is the raw message payload. Raw sessions are immutable once
-finalised; re-export does not modify them.
+`kind` is `jp` (6 joints), `jaw` (1 value) or `cp` (pose `x y z qx qy qz qw`).
+`stamp_ns` is the ROS header time, `t_ns` the time the PC received it.
 
-Disk usage is dominated by JPEGs. At 1280x1024, quality 95, 30 fps, stereo,
-expect roughly 6-12 MB/s, or 20-40 GB for a one-hour session. The final H.264
-videos are much smaller. Plan disk space before long collections.
+Raw data is the master copy: `convert` only reads it, and you can convert it
+again at any time.
 
----
-
-## 8. Export
+### 3.5 Convert to LeRobot
 
 ```bash
-./scripts/export.sh \
-  --sessions \
-    data/raw/20261027-140000_needle-transfer \
-    data/raw/20261027-141500_needle-transfer \
-  --output data/lerobot/needle_transfer
+./scripts/convert.sh --sessions data/raw/20261027-192407 --output data/lerobot/needle_pick
 ```
 
-- `--output` must not exist. The exporter writes a sibling `*.partial`
-  directory and renames it only after success, so an interrupted export never
-  looks complete.
-- On failure the partial directory is kept for inspection and the error is
-  printed. Remove it manually after inspecting it.
-- All sessions must share the same joint names and camera geometry.
-- Sessions whose `meta.json` status is not `ok` are refused by default; pass
-  `--allow-incomplete` only when you have inspected a crashed/failed session.
-- Each session becomes one episode; tasks are taken from `meta.json` and
-  deduplicated into `meta/tasks.jsonl`.
-- Re-exporting the same raw sessions is safe and produces a new directory.
+| Option | Meaning |
+|---|---|
+| `--sessions` | One or more **run folders** and/or **episode folders**. A run folder expands to its `episode_1..N` in numeric order (`episode_10` after `episode_9`) |
+| `--output` | New dataset folder. It must not exist yet; nothing is ever overwritten |
+| `--allow-incomplete` | Also convert episodes whose status is not `ok` |
+| `-c / --config` | Configuration file (tolerances and output video settings) |
 
-### Alignment policy
+Examples:
 
-1. **Stereo pairing.** Walk left frames in timestamp order and pair each with
-   the nearest unused right frame within `stereo_tolerance_ms`. Left is the
-   master clock.
-2. **Pair time.** Use the midpoint of the left and right timestamps.
-3. **Robot state.** For each arm, find the nearest `measured_js` and
-   `measured_cp` samples within `robot_tolerance_ms`. Duplicate header stamps
-   are collapsed to the first sample.
-4. **Drop incomplete rows.** If either joint or pose data is missing, the pair
-   is dropped and counted in the alignment notes.
-5. **Fixed output timeline.** Output `timestamp[k] = k / fps`. This is the
-   LeRobot playback timeline, not the raw capture time; the raw session keeps
-   the actual timestamps.
-6. **Action.** `action[t] = state[t + 1]`, with the final action repeated.
+```bash
+# Several runs into one dataset (episodes keep the order given)
+./scripts/convert.sh --sessions data/raw/20261027-192407 data/raw/20261028-101500 \
+  --output data/lerobot/needle_pick_all
 
-The CLI prints alignment notes per session, including stereo pairs, aligned
-frames, robot drops, median joint/pose skew, and a warning when the capture span
-differs from the nominal duration by more than 10%.
+# Only selected episodes
+./scripts/convert.sh --sessions data/raw/20261027-192407/episode_1 data/raw/20261027-192407/episode_3 \
+  --output data/lerobot/needle_pick_best
+```
 
-### Tolerances
-
-| Setting | Meaning | Suggested start |
-|---|---|---|
-| `stereo_tolerance_ms` | max left/right timestamp difference | 15 ms for two UVC cameras |
-| `robot_tolerance_ms` | max robot sample age at a stereo pair | 25 ms |
-
-Tighten the stereo tolerance if both eyes are hardware-synchronised. Raising it
-accepts more skew but keeps more frames.
-
----
-
-## 9. Dataset format
-
-The exporter writes LeRobot `codebase_version = "v2.1"`:
+Example output:
 
 ```text
-data/lerobot/needle_transfer/
-├── meta/
-│   ├── info.json
-│   ├── episodes.jsonl
-│   ├── episodes_stats.jsonl
-│   ├── stats.json
-│   └── tasks.jsonl
-├── data/
-│   └── chunk-000/
-│       ├── episode_000000.parquet
-│       └── episode_000001.parquet
-└── videos/
-    └── chunk-000/
-        ├── observation.images.left/
-        │   ├── episode_000000.mp4
-        │   └── episode_000001.mp4
-        └── observation.images.right/
-            ├── episode_000000.mp4
-            └── episode_000001.mp4
+[align] 20261027-192407/episode_1: left frames: 464, stereo pairs: 463, aligned frames: 463, dropped for robot: 0
+[align] 20261027-192407/episode_1: median jp/jaw/cp header skew: 0.6 ms
+[align] 20261027-192407/episode_2: left frames: 372, stereo pairs: 372, aligned frames: 372, dropped for robot: 0
+[align] 20261027-192407/episode_2: median jp/jaw/cp header skew: 0.6 ms
+dataset: /home/zhang/zst/Open-H-Embodiment-dVRK-v2/data/lerobot/needle_pick
+episodes: 2, frames: 835
 ```
 
-### Frames
+How to read it:
 
-| Feature | dtype | Shape | Notes |
-|---|---|---|---|
-| `observation.state` | `float32` | `[D]` | joints then pose, per arm |
-| `action` | `float32` | `[D]` | next state (placeholder) |
-| `observation.images.left` | `video` | `[H, W, 3]` | H.264, `yuv420p` |
-| `observation.images.right` | `video` | `[H, W, 3]` | H.264, `yuv420p` |
-| `timestamp` | `float32` | `[1]` | `frame_index / fps` |
-| `frame_index` | `int64` | `[1]` | `0..N-1` per episode |
-| `episode_index` | `int64` | `[1]` | global episode id |
-| `index` | `int64` | `[1]` | global frame id |
-| `task_index` | `int64` | `[1]` | index into `tasks.jsonl` |
+| Field | Meaning | Healthy value |
+|---|---|---|
+| `left frames` | Frames recorded by the left camera | about 30 per second |
+| `stereo pairs` | Left frames that found a right frame within `stereo_tolerance_ms` | close to `left frames` |
+| `aligned frames` | Pairs that also found robot data within `robot_tolerance_ms`. **These become the dataset frames** | close to `stereo pairs` |
+| `dropped for robot` | Pairs without robot data close enough in time | 0 or a few |
+| `header skew` | Spread between the joint, jaw and pose samples used for one frame | a few ms |
+| `capture span ... differs` (warning) | The cameras dropped frames during recording | absent |
 
-`D` is the sum over arms of `len(measured_js.position) + 7`.
+Episodes in a run folder whose status is not `ok` are skipped with a
+`[convert] skipping ...` line. If conversion fails, the half-written output is
+kept as `<output>.partial` for inspection; delete it before retrying.
 
-### Metadata
+### 3.6 How the time alignment works
 
-- `info.json`: version, fps, splits, path templates, feature schema, and video
-  codec/pixel format. `total_videos` counts two videos per episode.
-- `episodes.jsonl`: one `{episode_index, tasks, length}` row per episode.
-- `tasks.jsonl`: one `{task_index, task}` row per unique task string.
-- `episodes_stats.jsonl`: per-episode min/max/mean/std/count for every feature.
-- `stats.json`: dataset-level pooled statistics (weighted mean and pooled
-  variance, matching LeRobot's aggregation rule).
+The robot (about 100 Hz per topic) and the two cameras (about 30 fps each) run
+on independent clocks. `convert` builds one row per video frame:
 
-Videos are encoded with `libx264`, CRF 18, `yuv420p`, and
-`-movflags +faststart`. The exporter probes the encoded file and writes the
-actual codec, pixel format, dimensions, and fps into `info.json`; it does not
-trust the requested settings.
+1. **Stereo pairing.** Each left frame is paired with the nearest unused right
+   frame. Pairs further apart than `stereo_tolerance_ms` are discarded.
+2. **Frame time.** The time of a pair is the midpoint of its two capture times.
+3. **Robot state.** For each arm, the nearest `jp`, `jaw` and `cp` samples (by
+   ROS header time) are attached. If any is further away than
+   `robot_tolerance_ms`, the frame is dropped.
+4. **Output timeline.** Kept frames are numbered `0..N-1` with
+   `timestamp = frame_index / fps` (what LeRobot expects). The true capture
+   times stay in the raw folder.
+5. **Video.** Only the kept frames are re-encoded into the dataset MP4s, so
+   video frame *k* always matches parquet row *k*.
+
+### 3.7 Verify
+
+```bash
+uv run --no-sync dvrk-lerobot verify --dataset data/lerobot/needle_pick
+```
+
+```text
+episodes: 2
+frames: 835
+tasks: 1
+fps: 30
+state_dimension: 28
+dataset structure: PASS
+```
+
+It checks metadata totals, parquet columns and indices, `timestamp = k / fps`,
+and that every video exists with the expected size. It does not decode every
+video frame; load the dataset with LeRobot as the final check (section 5).
 
 ---
 
-## 10. Verification and loading
+## 4. The LeRobot dataset
 
-### 10.1 Built-in verification
-
-```bash
-uv run --no-sync dvrk-lerobot verify --dataset data/lerobot/needle_transfer
+```text
+data/lerobot/needle_pick/
+├── meta/
+│   ├── info.json              ← fps, features, shapes, codec, path templates
+│   ├── episodes.jsonl         ← {episode_index, tasks, length} per episode
+│   ├── tasks.jsonl            ← {task_index, task}
+│   ├── episodes_stats.jsonl   ← per-episode min/max/mean/std
+│   └── stats.json             ← dataset-wide statistics
+├── data/chunk-000/
+│   ├── episode_000000.parquet
+│   └── episode_000001.parquet
+└── videos/chunk-000/
+    ├── observation.images.left/episode_000000.mp4 ...
+    └── observation.images.right/episode_000000.mp4 ...
 ```
 
-The verifier checks:
+| Feature | Type / shape | Content |
+|---|---|---|
+| `observation.state` | float32 `[28]` | per arm (PSM1, then PSM2): 6 joints, jaw, pose `x y z qx qy qz qw` |
+| `action` | float32 `[28]` | next state (`state[t+1]`, last row repeated); a placeholder, see Limitations |
+| `observation.images.left` | video `[1080, 1920, 3]` | H.264, yuv420p, 30 fps |
+| `observation.images.right` | video `[1080, 1920, 3]` | H.264, yuv420p, 30 fps |
+| `timestamp` | float32 | `frame_index / fps` |
+| `frame_index` | int64 | `0..N-1` within the episode |
+| `episode_index` | int64 | episode number in the dataset |
+| `index` | int64 | global frame number across episodes |
+| `task_index` | int64 | row in `tasks.jsonl` |
 
-- `codebase_version`, episode lengths, `total_frames`, `total_tasks`, and
-  `total_videos`;
-- parquet column order, fixed-size state/action lists, `frame_index`,
-  `episode_index`, global `index`, task indices, and `timestamp = k / fps`;
-- every MP4 exists and its dimensions match `info.json`;
-- `episodes_stats.jsonl` has one row per episode.
+State names, in order (stored in `info.json`):
 
-It does not decode every video frame; ffprobe reads the container metadata.
-Use a full LeRobot loader as the final compatibility check in the training
-environment.
+```text
+PSM1.jp.yaw  PSM1.jp.pitch  PSM1.jp.insertion  PSM1.jp.roll  PSM1.jp.wrist_pitch  PSM1.jp.wrist_yaw
+PSM1.jaw
+PSM1.cp.x  PSM1.cp.y  PSM1.cp.z  PSM1.cp.qx  PSM1.cp.qy  PSM1.cp.qz  PSM1.cp.qw
+PSM2.… (same 14 values)
+```
 
-### 10.2 Loading with LeRobot
+Units are those published by the dVRK: radians for revolute joints and the jaw,
+metres for insertion and position. The pose is in each arm's base frame
+(`PSM1_base`, `PSM2_base`).
 
-Install LeRobot in a **separate** environment used for training. Avoid adding
-its PyTorch stack to the ROS acquisition environment.
+## 5. Loading in LeRobot
+
+Use a **separate** Python environment for training, so the PyTorch stack does
+not mix with the ROS acquisition environment:
 
 ```bash
-# Example training environment, separate from this repository's .venv
-python -m venv ~/envs/lerobot
-source ~/envs/lerobot/bin/activate
-pip install "lerobot==0.3.3"
+python -m venv ~/envs/lerobot && source ~/envs/lerobot/bin/activate
+pip install "lerobot==0.3.3"      # uses the v2.1 dataset format
 ```
 
 ```python
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-dataset = LeRobotDataset(
-    repo_id="local/needle_transfer",
-    root="data/lerobot/needle_transfer",
-)
-print(dataset)
-sample = dataset[0]
-print(sample["observation.state"].shape)
+ds = LeRobotDataset("local/needle_pick", root="data/lerobot/needle_pick")
+print(ds)
+sample = ds[0]
+print(sample["observation.state"].shape)          # torch.Size([28])
+print(sample["observation.images.left"].shape)    # torch.Size([3, 1080, 1920])
 ```
 
-LeRobot 0.3.3 uses the v2.1 dataset codebase. Newer LeRobot releases may default
-to the v3.0 writer while still reading v2.1; check your installed version. The
-exporter targets the v2.1 on-disk schema and does not depend on a particular
-LeRobot Python API.
-
-The synthetic integration dataset produced by this repository was loaded with
-`lerobot==0.3.3` (CPU Torch, PyAV video backend) during development; all samples,
-including both video streams, decoded successfully. Repeat this smoke test with
-the exact version used for training.
+Newer LeRobot releases default to the v3.0 format. Check that the version you
+train with can read v2.1 datasets.
 
 ---
 
-## 11. Testing
+## 6. Configuration
+
+All settings are in [configs/record.yaml](configs/record.yaml). `record` and
+`convert` read the same file.
+
+### `arms`
+
+```yaml
+arms:
+  - name: PSM1
+    js_topic: /PSM1/measured_js        # sensor_msgs/JointState, 6 joints
+    cp_topic: /PSM1/measured_cp        # geometry_msgs/PoseStamped
+    jaw_topic: /PSM1/jaw/measured_js   # sensor_msgs/JointState, 1 value
+  - name: PSM2
+    ...
+```
+
+The order of arms is the order inside `observation.state`. Keep it the same for
+all recordings that go into one dataset. To record a single arm, delete the
+other block.
+
+### `cameras`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `device` | `/dev/video0` (left), `/dev/video2` (right) | V4L2 device. Swap them if left and right are reversed |
+| `width`, `height` | 1920, 1080 | Must be a mode the capture card supports |
+| `fps` | 30 | Must equal `dataset.fps` |
+| `fourcc` | `MJPG` | Pixel format requested from the card |
+| `crf` | 18 | Quality of the **raw recording**. Lower = better and larger; 18 is visually lossless, 23 is about 2.5x smaller |
+
+List the modes your card supports:
 
 ```bash
-uv run --no-sync pytest
-uv run --no-sync ruff check src tests
+ffmpeg -hide_banner -f v4l2 -list_formats all -i /dev/video0
 ```
 
-Test layers:
+### `dataset`
 
-- `tests/unit/test_config.py`: YAML validation and failure messages.
-- `tests/unit/test_session.py`: raw session round-trip and malformed input.
-- `tests/unit/test_alignment.py`: greedy stereo pairing, state construction,
-  timestamps, dropped robot frames, missing pose data.
-- `tests/unit/test_stats.py`: numeric statistics and pooled aggregation.
-- `tests/integration/test_export.py`: two synthetic sessions, MP4 encoding,
-  parquet schema, metadata, export refusal, and `verify`.
+| Key | Default | Meaning |
+|---|---|---|
+| `fps` | 30 | Dataset frame rate |
+| `robot_type` | `dvrk` | Written to `info.json` |
+| `video_codec` | `h264` | Only `h264` is supported |
+| `video_crf` | 18 | Quality of the **dataset videos** written by `convert` |
+| `video_preset` | `medium` | x264 speed/size trade-off for `convert` (`veryfast` … `veryslow`) |
 
-The integration test requires `ffmpeg` with `libx264`.
+### `alignment`
 
----
+| Key | Default | Meaning |
+|---|---|---|
+| `stereo_tolerance_ms` | 15 | Max time difference between a left and right frame |
+| `robot_tolerance_ms` | 25 | Max time difference between a frame and the robot sample attached to it |
 
-## 12. Assumptions and limitations
-
-1. **One raw session is one episode.** There is no in-recording start/stop
-   trigger or episode splitter yet. Record separate sessions for separate
-   demonstrations.
-2. **`action` is a placeholder.** It is the next measured state, not the
-   commanded teleoperation action. Replace it with `servo_jp`, `setpoint_js`, or
-   the master-side command before training a policy that needs true actions.
-3. **Software stereo synchronisation.** Each eye is timestamped in user space;
-   there is no hardware trigger or genlock. Check
-   `alignment.stereo_tolerance_ms` and the alignment notes.
-4. **Fixed-rate timeline.** The output timeline is `k / fps`, not the raw
-   capture instants. Large frame drops are reported as a span mismatch but are
-   not repaired. The raw JPEGs retain the true capture times for audit.
-5. **JPEG intermediate.** Raw frames are JPEG quality 95 and are re-encoded to
-   H.264 CRF 18. This is convenient and compact, but not lossless. Add a
-   PNG/FFV1 raw mode if the experiment requires lossless intermediates.
-6. **No image rectification or calibration.** The videos are the raw camera
-   streams. Intrinsics, extrinsics, and rectification maps are not stored in the
-   LeRobot dataset.
-7. **Only positions are exported.** `measured_js.velocity`, `measured_js.effort`,
-   `measured_cv`, `measured_cf`, and other CRTK streams are not stored yet.
-   Extend `acquire/node.py` and `acquire/session.py` before adding them to the
-   state vector.
-8. **No rosbag2 copy.** The raw session format is intentionally small and
-   inspectable. If you also need the full ROS graph, record a rosbag alongside
-   it.
-9. **Single-machine, wall-clock acquisition.** `use_sim_time` must be false.
-   The header-stamp/wall-clock offset is checked by `doctor` and warned about by
-   the recorder.
-10. **H.264 only.** The exporter validates `libx264` output. AV1/HEVC support
-    would only require changing `dataset/video.py` and the schema expectations.
+Changing `dataset` or `alignment` only needs a new `convert`; the raw data does
+not have to be recorded again.
 
 ---
 
-## 13. Troubleshooting
+## 7. Disk space and performance
+
+| | Size |
+|---|---|
+| Raw recording, 1080p stereo, `crf: 18` | about 18 MB/s, **about 65 GB per hour** |
+| Dataset, 1080p stereo, `video_crf: 18` | about 16 MB/s (for example, 459 MB for 28 s) |
+
+- Each camera is encoded to H.264 while recording, using about 2 CPU cores per
+  eye.
+- `convert` takes roughly as long as the recording on this machine. It uses many
+  cores while encoding.
+- Free space: `df -h .`. Delete raw runs only after converting and checking them.
+
+---
+
+## 8. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `ModuleNotFoundError: rclpy` | `.venv` was created without system site packages | remove `.venv`, rerun `scripts/setup_env.sh` |
-| `cannot open /dev/video0` | permissions, device busy, or wrong node | `sudo usermod -aG video $USER`, log out/in; close other camera apps |
-| `negotiated WxH, expected ...` | camera does not support the requested mode | check `v4l2-ctl --list-formats-ext`, update YAML |
-| `no data within 20s` | dVRK not running or wrong topic names | `ros2 topic list`, `ros2 topic hz`, update YAML |
-| `fewer than two stereo pairs` | cameras not producing frames, or tolerance too tight | run `doctor`, check devices, raise `stereo_tolerance_ms` |
-| `no cp samples` | wrong `measured_cp` topic or no pose publisher | `ros2 topic type` / `ros2 topic hz` |
-| header stamp skew warning | `use_sim_time` enabled or clock mismatch | set `use_sim_time=false`, check `date` and ROS time |
-| `ffmpeg not found` | ffmpeg absent | `sudo apt install ffmpeg` |
-| `libx264` encode failure | ffmpeg built without x264 | install Ubuntu's `ffmpeg` package |
-| `output already exists` | export target is not new | choose a new `--output` or move the old dataset |
-| `export failed ... partial output kept` | inspect the partial directory | fix the reported error, remove partial, re-export |
-| ROS log permission error | `~/.ros` not writable | scripts already set `ROS_LOG_DIR` to `./.ros`; override it if needed |
+| `ModuleNotFoundError: rclpy` | `.venv` created without system packages | `rm -rf .venv && ./scripts/setup_env.sh` |
+| `no data within 20s; missing: /PSM1/...` | dVRK console not running, or a topic name differs | Start the console; `ros2 topic list \| grep PSM`; fix `arms` in the config |
+| `cannot open /dev/video0` | Device busy or no permission | Close other camera apps (including another recorder); `sudo usermod -aG video $USER`, then log in again |
+| `negotiated 1280x720, expected 1920x1080` | Mode not supported by the card | Pick a listed mode (section 6) |
+| Preview window does not appear / Qt `xcb` error | No display (e.g. SSH session) | Run from the desktop session, or `ssh -X` |
+| Keys do nothing | Neither the preview window nor the terminal has focus | Click the preview window or the terminal |
+| Many `dropped for robot` frames | Robot topics stalled during recording | Check `ros2 topic hz /PSM1/measured_js`; raise `robot_tolerance_ms` only if the gaps are small |
+| `stereo pairs` much lower than `left frames` | The two capture cards started half a frame apart | Re-convert with `stereo_tolerance_ms: 20` |
+| `capture span ... differs from nominal` | Cameras dropped frames (CPU or USB overload) | Close other heavy programs; check the USB connections |
+| `session status is 'aborted'` | The episode was ended with `q` / Ctrl+C | Add `--allow-incomplete` if the episode is usable |
+| `output already exists` | `--output` folder exists | Choose a new name, or delete the old dataset |
+| `convert failed ... partial output kept` | Error during conversion | Read the message, delete `<output>.partial`, run again |
+| `ModuleNotFoundError: lark` when running `pytest` | ROS's pytest plugin is loaded from `PYTHONPATH` | `env -u PYTHONPATH uv run --no-sync pytest` |
 
-For a minimal camera-only check without ROS:
+Check a single camera without the recorder:
 
 ```bash
-ffplay -f v4l2 -input_format mjpeg -video_size 1280x1024 -framerate 30 /dev/video0
+ffplay -f v4l2 -input_format mjpeg -video_size 1920x1080 -framerate 30 /dev/video0
 ```
 
 ---
 
-## 14. Next steps
+## 9. Limitations
 
-Recommended changes before a large ex-vivo campaign:
+- **`action` is a placeholder.** It is the next measured state, not the
+  operator's command. Record a command topic (for example `/PSM1/setpoint_js`)
+  before training a policy that needs true actions.
+- **Software stereo sync.** Each eye is timestamped by the PC when its frame
+  arrives; the capture cards are not hardware-synchronised.
+- **No camera calibration.** Intrinsics, stereo extrinsics and
+  camera-to-robot registration are not stored.
+- **Positions only.** Joint velocities, efforts and other CRTK topics are not
+  recorded.
+- **One task per run.** All episodes of one `record` run share its `--task`.
 
-1. Decide the action source. Subscribe to `/PSM1/servo_jp` or
-   `/PSM1/setpoint_js` and store a `raw_action` stream; export `action` from
-   that stream instead of next-state.
-2. Add a foot-pedal or keyboard start/stop trigger and per-episode segmentation.
-3. Decide whether JPEG quality 95 is sufficient or a lossless intermediate is
-   required.
-4. Characterise the stereo skew with a flashing LED or checkerboard before
-   trusting the default 15 ms tolerance.
-5. Record camera intrinsics/extrinsics and the dVRK arm-to-camera registration
-   alongside the dataset (for example, in a sidecar `calibration/` directory).
-6. Smoke-test one exported dataset with the exact LeRobot version used for
-   training, including video decoding.
+## 10. Development
 
----
+```bash
+env -u PYTHONPATH uv run --no-sync pytest   # unit + integration tests (needs ffmpeg)
+uv run --no-sync ruff check src tests
+```
 
-## 15. References
-
-- dVRK: <https://github.com/jhu-dvrk/dvrk2>
-- CRTK: <https://github.com/jhu-cisst/cisst-ros>
-- LeRobot dataset format: <https://github.com/huggingface/lerobot>
-- ROS 2 Humble: <https://docs.ros.org/en/humble/>
-- uv: <https://docs.astral.sh/uv/>
+| Path | Contents |
+|---|---|
+| `scripts/` | `setup_env.sh`, `doctor.sh`, `record.sh`, `convert.sh` |
+| `configs/record.yaml` | Topics, cameras, tolerances, video settings |
+| `src/dvrk_lerobot/acquire/` | Recorder: ROS node, cameras, preview, keyboard, raw session files |
+| `src/dvrk_lerobot/align/` | Time alignment |
+| `src/dvrk_lerobot/dataset/` | LeRobot writer: parquet, video, metadata, statistics |
+| `src/dvrk_lerobot/tools/` | `doctor` and `verify` |
+| `tests/` | Unit and integration tests |
