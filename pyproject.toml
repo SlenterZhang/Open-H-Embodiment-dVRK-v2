@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 dvrk-lerobot = "dvrk_lerobot.cli:main"
+dvrk-touchx = "dvrk_touchx.cli:main"
 
 [dependency-groups]
 dev = [
@@ -25,7 +26,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/dvrk_lerobot"]
+packages = ["src/dvrk_lerobot", "src/dvrk_touchx"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
