@@ -1,4 +1,4 @@
-# Acquisition settings shared by `record` and `export`.
+# Acquisition settings shared by `record` and `convert`.
 # Run `dvrk-lerobot doctor -c configs/record.yaml` before collecting data.
 
 dataset:
@@ -13,29 +13,34 @@ dataset:
 arms:
   # dVRK exposes measured_jp as the `.position` field of measured_js.
   # There is no separate measured_jp topic in CRTK / dVRK ROS 2.
+  # The jaw is published separately on jaw/measured_js (one position).
+  # Arm order defines the observation.state order; keep it stable.
   - name: PSM1
     js_topic: /PSM1/measured_js
     cp_topic: /PSM1/measured_cp
-  # Uncomment when a second arm is present. Keep names unique and stable.
-  # - name: PSM2
-  #   js_topic: /PSM2/measured_js
-  #   cp_topic: /PSM2/measured_cp
+    jaw_topic: /PSM1/jaw/measured_js
+  - name: PSM2
+    js_topic: /PSM2/measured_js
+    cp_topic: /PSM2/measured_cp
+    jaw_topic: /PSM2/jaw/measured_js
 
 cameras:
+  # Raw recording is encoded live to H.264 (libx264 veryfast). Lower crf = higher
+  # quality and larger files; 18 is visually lossless, 23 is roughly 2.5x smaller.
   left:
     device: /dev/video0
-    width: 1280
-    height: 1024
+    width: 1920
+    height: 1080
     fps: 30
     fourcc: MJPG
-    jpeg_quality: 95
+    crf: 18
   right:
     device: /dev/video2
-    width: 1280
-    height: 1024
+    width: 1920
+    height: 1080
     fps: 30
     fourcc: MJPG
-    jpeg_quality: 95
+    crf: 18
 
 alignment:
   # Maximum allowed |t_left - t_right| when forming a stereo pair.

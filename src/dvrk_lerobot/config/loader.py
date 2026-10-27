@@ -107,7 +107,7 @@ def _parse_cameras(raw: Any, fps: int) -> dict[str, CameraConfig]:
     for side in SIDES:
         where = f"cameras.{side}"
         item = _mapping(mapping.get(side), where)
-        _only(item, {"device", "width", "height", "fps", "fourcc", "jpeg_quality"}, where)
+        _only(item, {"device", "width", "height", "fps", "fourcc", "crf"}, where)
         width = _integer(item.get("width"), f"{where}.width", 2, 8192)
         height = _integer(item.get("height"), f"{where}.height", 2, 8192)
         if width % 2 or height % 2:
@@ -128,7 +128,7 @@ def _parse_cameras(raw: Any, fps: int) -> dict[str, CameraConfig]:
             height=height,
             fps=camera_fps,
             fourcc=fourcc,
-            jpeg_quality=_integer(item.get("jpeg_quality"), f"{where}.jpeg_quality", 1, 100),
+            crf=_integer(item.get("crf"), f"{where}.crf", 0, 51),
         )
     if cameras["left"].device == cameras["right"].device:
         raise ConfigError("left and right cameras must use different devices")

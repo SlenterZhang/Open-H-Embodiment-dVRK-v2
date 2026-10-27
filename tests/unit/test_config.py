@@ -19,7 +19,12 @@ def _raw() -> dict:
             "video_preset": "medium",
         },
         "arms": [
-            {"name": "PSM1", "js_topic": "/PSM1/measured_js", "cp_topic": "/PSM1/measured_cp"},
+            {
+                "name": "PSM1",
+                "js_topic": "/PSM1/measured_js",
+                "cp_topic": "/PSM1/measured_cp",
+                "jaw_topic": "/PSM1/jaw/measured_js",
+            },
         ],
         "cameras": {
             "left": {
@@ -28,7 +33,7 @@ def _raw() -> dict:
                 "height": 480,
                 "fps": 30,
                 "fourcc": "MJPG",
-                "jpeg_quality": 95,
+                "crf": 18,
             },
             "right": {
                 "device": "/dev/video2",
@@ -36,7 +41,7 @@ def _raw() -> dict:
                 "height": 480,
                 "fps": 30,
                 "fourcc": "MJPG",
-                "jpeg_quality": 95,
+                "crf": 18,
             },
         },
         "alignment": {"stereo_tolerance_ms": 15.0, "robot_tolerance_ms": 25.0},
@@ -48,6 +53,13 @@ def test_repository_config_is_valid() -> None:
     assert config.dataset.fps == 30
     assert config.arms[0].name == "PSM1"
     assert config.cameras["left"].device == "/dev/video0"
+
+
+def test_missing_jaw_topic_is_rejected() -> None:
+    raw = _raw()
+    del raw["arms"][0]["jaw_topic"]
+    with pytest.raises(ConfigError, match="jaw_topic"):
+        parse_config(raw)
 
 
 def test_unknown_key_is_rejected() -> None:

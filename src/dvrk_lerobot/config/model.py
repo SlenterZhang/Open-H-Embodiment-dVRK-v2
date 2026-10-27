@@ -27,7 +27,7 @@ class CameraConfig:
     height: int
     fps: int
     fourcc: str
-    jpeg_quality: int
+    crf: int
 
 
 @dataclass(frozen=True)
