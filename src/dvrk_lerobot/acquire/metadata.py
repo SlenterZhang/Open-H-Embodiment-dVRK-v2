@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,33 +11,25 @@ from dvrk_lerobot.acquire.camera import CameraError
 from dvrk_lerobot.config import AppConfig
 
 
-def new_session_dir(root: Path, task: str) -> Path:
-    """Create a unique, task-labelled session directory under *root*."""
-    root.mkdir(parents=True, exist_ok=True)
-    slug = re.sub(r"[^a-z0-9]+", "-", task.lower()).strip("-")[:40] or "episode"
-    base = f"{time.strftime('%Y%m%d-%H%M%S')}_{slug}"
-    candidate = root / base
-    suffix = 1
-    while candidate.exists():
-        candidate = root / f"{base}-{suffix}"
-        suffix += 1
-    return candidate
+def new_run_dir(root: Path) -> Path:
+    """Create the datetime-named directory that holds one run's episode_1..n."""
+    run = root / datetime.now().strftime("%Y%m%d-%H%M%S")
+    run.mkdir(parents=True)
+    return run
 
 
 def build_meta(
     config: AppConfig,
     session_dir: Path,
     task: str,
-    operator: str,
     notes: str,
     camera_info: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     """Build the initial meta.json payload for one recording."""
     return {
-        "session_id": session_dir.name,
+        "session_id": f"{session_dir.parent.name}/{session_dir.name}",
         "created_ns": time.time_ns(),
         "task": task,
-        "operator": operator,
         "notes": notes,
         "fps": config.dataset.fps,
         "clock": "system",
@@ -57,7 +49,7 @@ def build_meta(
                 "height": camera.height,
                 "fps": camera.fps,
                 "fourcc": camera.fourcc,
-                "jpeg_quality": camera.jpeg_quality,
+                "crf": camera.crf,
                 "negotiated": camera_info[side],
             }
             for side, camera in config.cameras.items()

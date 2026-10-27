@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 
 from geometry_msgs.msg import PoseStamped
@@ -21,7 +22,8 @@ class RecorderNode(Node):
     def __init__(self, config: AppConfig) -> None:
         super().__init__("dvrk_lerobot_recorder")
         self.config = config
-        self.session: RawSession | None = None
+        self._session: RawSession | None = None
+        self._lock = threading.Lock()
         self.joint_names: dict[str, list[str]] = {}
         self.frame_ids: dict[str, str] = {}
         self.seen: dict[str, set[str]] = {arm.name: set() for arm in config.arms}
@@ -45,6 +47,16 @@ class RecorderNode(Node):
                 lambda message, current=arm: self._on_jaw(current, message),
                 qos_profile_sensor_data,
             )
+
+    def attach(self, session: RawSession | None) -> None:
+        """Start (or with None, stop) forwarding samples; safe while callbacks run."""
+        with self._lock:
+            self._session = session
+
+    def _write(self, arm: str, kind: str, received: int, stamp: int, values: list[float]) -> None:
+        with self._lock:
+            if self._session is not None:
+                self._session.add_robot(arm, kind, received, stamp, values)
 
     def ready(self) -> bool:
         return all({"jp", "cp", "jaw"} <= kinds for kinds in self.seen.values())
@@ -76,8 +88,7 @@ class RecorderNode(Node):
             names = [f"joint_{index}" for index in range(len(positions))]
         self.joint_names.setdefault(arm.name, names)
         self.seen[arm.name].add("jp")
-        if self.session is not None:
-            self.session.add_robot(arm.name, "jp", received, stamp, positions)
+        self._write(arm.name, "jp", received, stamp, positions)
 
     def _on_jaw(self, arm, message: JointState) -> None:
         received = time.time_ns()
@@ -87,8 +98,7 @@ class RecorderNode(Node):
             self._warn_once(arm.name, "jaw-size", f"{arm.jaw_topic} must have one position")
             return
         self.seen[arm.name].add("jaw")
-        if self.session is not None:
-            self.session.add_robot(arm.name, "jaw", received, stamp, list(message.position))
+        self._write(arm.name, "jaw", received, stamp, list(message.position))
 
     def _on_cp(self, arm, message: PoseStamped) -> None:
         received = time.time_ns()
@@ -110,8 +120,7 @@ class RecorderNode(Node):
             self._warn_once(arm.name, "cp-finite", f"{arm.cp_topic} has non-finite values")
             return
         self.seen[arm.name].add("cp")
-        if self.session is not None:
-            self.session.add_robot(arm.name, "cp", received, stamp, values)
+        self._write(arm.name, "cp", received, stamp, values)
 
     def _warn_clock(self, arm: str, kind: str, stamp_ns: int, received_ns: int) -> None:
         if stamp_ns <= 0:

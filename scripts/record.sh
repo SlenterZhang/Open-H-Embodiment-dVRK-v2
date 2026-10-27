@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Record one raw session with ROS 2 Humble and the dVRK workspace sourced.
+# Record episodes interactively (s = start, e = end, q = quit) with ROS 2 sourced.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 set +u

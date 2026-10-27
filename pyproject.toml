@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10,<3.12"
 dependencies = [
     "numpy>=1.24,<2",
-    "opencv-python-headless==4.10.0.84",
+    "opencv-python==4.10.0.84",
     "pyarrow>=14,<19",
     "PyYAML>=6,<7",
 ]
