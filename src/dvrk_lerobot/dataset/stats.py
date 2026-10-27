@@ -26,18 +26,15 @@ def numeric_stats(values: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
-def video_stats(paths: Sequence[Path]) -> dict[str, np.ndarray]:
-    """Channel statistics in [0, 1], shape (3, 1, 1), from sampled frames."""
-    import cv2
+def video_stats(source: Path, indices: Sequence[int]) -> dict[str, np.ndarray]:
+    """Channel statistics in [0, 1], shape (3, 1, 1), from sampled frames of *source*."""
+    from dvrk_lerobot.dataset.video import read_frames
 
-    if not paths:
+    if not indices:
         raise ValueError("no video frames to summarize")
-    indices = _sample_indices(len(paths))
+    sampled = [indices[position] for position in _sample_indices(len(indices))]
     frames: list[np.ndarray] = []
-    for index in indices:
-        image = cv2.imread(str(paths[index]), cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError(f"cannot decode frame: {paths[index]}")
+    for image in read_frames(source, sampled):
         image = image[:, :, ::-1]
         height, width = image.shape[:2]
         if max(height, width) >= 300:

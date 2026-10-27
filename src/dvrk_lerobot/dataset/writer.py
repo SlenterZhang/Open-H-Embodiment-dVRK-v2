@@ -33,7 +33,7 @@ def export_dataset(episodes: Sequence[Episode], config: AppConfig, output: Path)
     """Write all episodes under *output*; refuse to reuse an existing path."""
     items = list(episodes)
     if not items:
-        raise ExportError("no episodes to export")
+        raise ExportError("no episodes to convert")
     names = items[0].state_names
     for episode in items:
         if episode.state_names != names:
@@ -62,6 +62,7 @@ def export_dataset(episodes: Sequence[Episode], config: AppConfig, output: Path)
                 raise ExportError(f"{episode.session}: task is empty")
             task_index = tasks.setdefault(task, len(tasks))
             left_info = video.encode(
+                episode.videos["left"],
                 episode.left,
                 partial / schema.video_path(episode_index, "left"),
                 fps=config.dataset.fps,
@@ -69,6 +70,7 @@ def export_dataset(episodes: Sequence[Episode], config: AppConfig, output: Path)
                 preset=config.dataset.video_preset,
             )
             right_info = video.encode(
+                episode.videos["right"],
                 episode.right,
                 partial / schema.video_path(episode_index, "right"),
                 fps=config.dataset.fps,
@@ -121,7 +123,7 @@ def export_dataset(episodes: Sequence[Episode], config: AppConfig, output: Path)
         )
     except Exception as exc:
         # Keep the partial tree for inspection; never delete user data.
-        raise ExportError(f"export failed: {exc}; partial output kept at {partial}") from exc
+        raise ExportError(f"convert failed: {exc}; partial output kept at {partial}") from exc
     os.replace(partial, destination)
     return ExportResult(root=destination, episodes=len(items), frames=total_frames)
 
@@ -131,8 +133,8 @@ def _stats(episode: Episode, episode_index: int, task_index: int, index_offset: 
     return {
         "observation.state": stats.numeric_stats(episode.state),
         "action": stats.numeric_stats(episode.action),
-        "observation.images.left": stats.video_stats(episode.left),
-        "observation.images.right": stats.video_stats(episode.right),
+        "observation.images.left": stats.video_stats(episode.videos["left"], episode.left),
+        "observation.images.right": stats.video_stats(episode.videos["right"], episode.right),
         "timestamp": stats.numeric_stats(episode.timestamps),
         "frame_index": stats.numeric_stats(np.arange(frames, dtype=np.int64)),
         "episode_index": stats.numeric_stats(np.full(frames, episode_index, dtype=np.int64)),
