@@ -1,4 +1,4 @@
-"""Raw on-disk session: robot JSONL plus timestamped stereo JPEG frames."""
+"""Raw on-disk session: robot JSONL plus stereo H.264 videos with frame timestamps."""
 
 from __future__ import annotations
 
@@ -9,16 +9,18 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
-RAW_FORMAT = "dvrk-raw-v1"
+from dvrk_lerobot.dataset.video import count_frames
+
+RAW_FORMAT = "dvrk-raw-v2"
 SIDES = ("left", "right")
 
 
 @dataclass(frozen=True)
 class Frame:
-    """One captured camera frame and its wall-clock timestamp."""
+    """One captured camera frame: wall-clock timestamp and index in the side's video."""
 
     ts_ns: int
-    path: Path
+    index: int
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,7 @@ class Session:
     meta: dict[str, Any]
     robot: list[RobotSample]
     frames: dict[str, list[Frame]]
+    videos: dict[str, Path]
 
     @property
     def task(self) -> str:
@@ -61,9 +64,7 @@ class RawSession:
         """Create *root*, its frame directories, and the initial meta.json."""
         if root.exists():
             raise FileExistsError(f"session directory already exists: {root}")
-        root.mkdir(parents=True)
-        for side in SIDES:
-            (root / "frames" / side).mkdir(parents=True)
+        (root / "video").mkdir(parents=True)
         meta = dict(meta)
         meta["format"] = RAW_FORMAT
         meta["status"] = "recording"
@@ -135,8 +136,14 @@ def load_session(path: str | Path) -> Session:
         raise ValueError(f"{root}: unsupported raw format {meta.get('format')!r}")
     arms = {str(item["name"]) for item in meta.get("arms", [])}
     robot = _load_robot(root / "robot.jsonl", arms)
-    frames = {side: _load_frames(root / "frames" / side) for side in SIDES}
-    return Session(root=root, meta=meta, robot=robot, frames=frames)
+    frames = {side: _load_frames(*video_files(root, side)) for side in SIDES}
+    videos = {side: video_files(root, side)[0] for side in SIDES}
+    return Session(root=root, meta=meta, robot=robot, frames=frames, videos=videos)
+
+
+def video_files(root: Path, side: str) -> tuple[Path, Path]:
+    """Paths of one side's raw video and its per-frame timestamp file."""
+    return root / "video" / f"{side}.mkv", root / "video" / f"{side}_timestamps.txt"
 
 
 def _load_robot(path: Path, arms: set[str]) -> list[RobotSample]:
@@ -169,23 +176,21 @@ def _load_robot(path: Path, arms: set[str]) -> list[RobotSample]:
     return samples
 
 
-def _load_frames(directory: Path) -> list[Frame]:
-    if not directory.is_dir():
-        raise ValueError(f"missing frame directory: {directory}")
-    frames: list[Frame] = []
-    for path in directory.glob("*.jpg"):
-        try:
-            ts_ns = int(path.stem)
-        except ValueError as exc:
-            raise ValueError(f"unexpected frame name: {path.name}") from exc
-        frames.append(Frame(ts_ns=ts_ns, path=path))
-    if not frames:
-        raise ValueError(f"no frames in {directory}")
-    frames.sort(key=lambda frame: frame.ts_ns)
-    for previous, current in pairwise(frames):
-        if current.ts_ns <= previous.ts_ns:
-            raise ValueError(f"frame timestamps are not increasing in {directory}")
-    return frames
+def _load_frames(video: Path, timestamps: Path) -> list[Frame]:
+    if not video.is_file() or not timestamps.is_file():
+        raise ValueError(f"missing raw video or timestamps: {video}")
+    try:
+        stamps = [int(line) for line in timestamps.read_text(encoding="utf-8").split()]
+    except ValueError as exc:
+        raise ValueError(f"{timestamps}: malformed timestamp") from exc
+    # After a crash the two can differ by the frames still buffered; keep the common prefix.
+    stamps = stamps[: count_frames(video)]
+    if not stamps:
+        raise ValueError(f"no frames in {video}")
+    for previous, current in pairwise(stamps):
+        if current <= previous:
+            raise ValueError(f"frame timestamps are not increasing in {timestamps}")
+    return [Frame(ts_ns=stamp, index=index) for index, stamp in enumerate(stamps)]
 
 
 def _write_meta(root: Path, meta: dict[str, Any]) -> None:

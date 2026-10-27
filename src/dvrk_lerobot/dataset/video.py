@@ -3,60 +3,109 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
-import tempfile
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
+
+import cv2
+import numpy as np
 
 
 class VideoError(RuntimeError):
     """ffmpeg or ffprobe failed, or produced unexpected metadata."""
 
 
-def encode(
-    frames: Sequence[Path], destination: Path, *, fps: int, crf: int, preset: str
-) -> dict[str, Any]:
-    """Encode JPEG *frames* to an H.264 yuv420p MP4 and return its metadata."""
-    if not frames:
-        raise VideoError(f"no frames to encode for {destination}")
+def start_encoder(
+    destination: Path, *, width: int, height: int, fps: int, crf: int, preset: str
+) -> subprocess.Popen:
+    """Start ffmpeg reading raw BGR frames on stdin and writing H.264 yuv420p."""
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".frames-", dir=destination.parent) as temporary:
-        directory = Path(temporary)
-        for index, frame in enumerate(frames):
-            os.symlink(frame.resolve(), directory / f"{index:06d}.jpg")
-        command = [
-            _binary("ffmpeg"),
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-framerate",
-            str(fps),
-            "-i",
-            str(directory / "%06d.jpg"),
-            "-c:v",
-            "libx264",
-            "-preset",
-            preset,
-            "-crf",
-            str(crf),
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            str(destination),
-        ]
-        _run(command, f"encode {destination}")
+    command = [
+        _binary("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
+        "-framerate", str(fps), "-i", "-",
+        # One output frame per input frame: frame i must match timestamp line i.
+        "-vsync", "passthrough",
+        "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
+    ]  # fmt: skip
+    if destination.suffix == ".mp4":
+        command += ["-movflags", "+faststart"]
+    command.append(str(destination))
+    try:
+        return subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise VideoError(f"cannot start ffmpeg for {destination}: {exc}") from exc
+
+
+def finish_encoder(process: subprocess.Popen, action: str) -> None:
+    """Close stdin, wait for ffmpeg to flush, and raise if it failed."""
+    _, stderr = process.communicate(timeout=600)
+    if process.returncode != 0:
+        raise VideoError(f"{action} failed: {_tail(stderr)}")
+
+
+def read_frames(source: Path, indices: Sequence[int]) -> Iterator[np.ndarray]:
+    """Decode *source* sequentially and yield the BGR frames at increasing *indices*."""
+    capture = cv2.VideoCapture(str(source))
+    if not capture.isOpened():
+        raise VideoError(f"cannot open {source}")
+    position = 0
+    try:
+        for index in indices:
+            if index < position:
+                raise VideoError(f"{source}: frame indices must increase")
+            while position <= index:
+                ok, frame = capture.read()
+                if not ok:
+                    raise VideoError(f"{source}: ends before frame {index}")
+                position += 1
+            yield frame
+    finally:
+        capture.release()
+
+
+def encode(
+    source: Path, indices: Sequence[int], destination: Path, *, fps: int, crf: int, preset: str
+) -> dict[str, Any]:
+    """Re-encode the selected frames of *source* to an H.264 yuv420p MP4."""
+    if not indices:
+        raise VideoError(f"no frames to encode for {destination}")
+    process: subprocess.Popen | None = None
+    try:
+        for frame in read_frames(source, indices):
+            if process is None:
+                height, width = frame.shape[:2]
+                process = start_encoder(
+                    destination, width=width, height=height, fps=fps, crf=crf, preset=preset
+                )
+            process.stdin.write(frame.data)
+    except BrokenPipeError:
+        pass  # ffmpeg exited early; finish_encoder reports its error
+    except BaseException:
+        if process is not None:
+            process.kill()
+        raise
+    finish_encoder(process, f"encode {destination}")
     info = probe(destination)
     if info["codec"] != "h264" or info["pix_fmt"] != "yuv420p":
         raise VideoError(f"{destination}: unexpected codec {info['codec']}/{info['pix_fmt']}")
     if info["fps"] != fps:
         raise VideoError(f"{destination}: encoded at {info['fps']} fps, expected {fps}")
     return info
+
+
+def count_frames(path: Path) -> int:
+    """Count video packets; libx264 writes exactly one packet per frame."""
+    command = [
+        _binary("ffprobe"), "-v", "error", "-select_streams", "v:0", "-count_packets",
+        "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path),
+    ]  # fmt: skip
+    result = subprocess.run(command, capture_output=True, check=False, timeout=600)
+    if result.returncode != 0:
+        raise VideoError(f"cannot count frames in {path}: {_tail(result.stderr)}")
+    return int(result.stdout.decode().strip() or 0)
 
 
 def probe(path: Path) -> dict[str, Any]:
@@ -98,15 +147,6 @@ def probe(path: Path) -> dict[str, Any]:
         "fps": fps,
         "channels": _channels(pix_fmt),
     }
-
-
-def _run(command: list[str], action: str) -> None:
-    try:
-        result = subprocess.run(command, capture_output=True, check=False, timeout=3600)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise VideoError(f"{action}: {exc}") from exc
-    if result.returncode != 0:
-        raise VideoError(f"{action} failed: {_tail(result.stderr)}")
 
 
 def _binary(name: str) -> str:
