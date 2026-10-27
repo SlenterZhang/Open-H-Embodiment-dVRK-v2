@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dvrk-lerobot"
+version = "0.1.0"
+description = "Record dVRK ROS 2 telemetry and stereo video into LeRobot Dataset v2.1."
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    "numpy>=1.24,<2",
+    "opencv-python-headless==4.10.0.84",
+    "pyarrow>=14,<19",
+    "PyYAML>=6,<7",
+]
+
+[project.scripts]
+dvrk-lerobot = "dvrk_lerobot.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dvrk_lerobot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

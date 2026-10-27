@@ -1,0 +1,44 @@
+# Acquisition settings shared by `record` and `export`.
+# Run `dvrk-lerobot doctor -c configs/record.yaml` before collecting data.
+
+dataset:
+  # Fixed output rate. Must equal both camera rates and the final video rate.
+  fps: 30
+  robot_type: dvrk
+  # Final H.264 settings. CRF 18 is visually near-lossless for this use case.
+  video_codec: h264
+  video_crf: 18
+  video_preset: medium
+
+arms:
+  # dVRK exposes measured_jp as the `.position` field of measured_js.
+  # There is no separate measured_jp topic in CRTK / dVRK ROS 2.
+  - name: PSM1
+    js_topic: /PSM1/measured_js
+    cp_topic: /PSM1/measured_cp
+  # Uncomment when a second arm is present. Keep names unique and stable.
+  # - name: PSM2
+  #   js_topic: /PSM2/measured_js
+  #   cp_topic: /PSM2/measured_cp
+
+cameras:
+  left:
+    device: /dev/video0
+    width: 1280
+    height: 1024
+    fps: 30
+    fourcc: MJPG
+    jpeg_quality: 95
+  right:
+    device: /dev/video2
+    width: 1280
+    height: 1024
+    fps: 30
+    fourcc: MJPG
+    jpeg_quality: 95
+
+alignment:
+  # Maximum allowed |t_left - t_right| when forming a stereo pair.
+  stereo_tolerance_ms: 15.0
+  # Maximum allowed age of the nearest robot sample for a stereo pair.
+  robot_tolerance_ms: 25.0
