@@ -1,4 +1,4 @@
-"""Command line entry points for recording, export, verification, and checks."""
+"""Command line entry points for recording, conversion, verification, and checks."""
 
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "record":
             return _record(args)
-        if args.command == "export":
-            return _export(args)
+        if args.command == "convert":
+            return _convert(args)
         if args.command == "verify":
             return _verify(args)
         if args.command == "doctor":
@@ -40,22 +40,15 @@ def main(argv: list[str] | None = None) -> int:
 def _record(args: argparse.Namespace) -> int:
     from dvrk_lerobot.acquire.recorder import run_record
 
-    if args.duration < 0:
-        raise ValueError("--duration must be zero or positive")
     config = load_config(args.config)
-    path = run_record(
-        config,
-        Path(args.root),
-        task=args.task,
-        operator=args.operator,
-        notes=args.notes,
-        duration=args.duration,
-    )
-    print(f"raw session: {path}")
+    paths = run_record(config, Path(args.root), task=args.task, notes=args.notes)
+    print(f"recorded {len(paths)} episode(s)")
+    for path in paths:
+        print(f"raw session: {path}")
     return 0
 
 
-def _export(args: argparse.Namespace) -> int:
+def _convert(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     options = AlignOptions(
         fps=config.dataset.fps,
@@ -63,21 +56,38 @@ def _export(args: argparse.Namespace) -> int:
         robot_tolerance_ms=config.alignment.robot_tolerance_ms,
     )
     episodes = []
-    for path in args.sessions:
+    for path, from_run in _session_paths(args.sessions):
         session = load_session(path)
         status = session.meta.get("status")
         if status != "ok" and not args.allow_incomplete:
+            if from_run:
+                print(f"[convert] skipping {path}: status {status!r}")
+                continue
             raise ValueError(
-                f"{path}: session status is {status!r}; use --allow-incomplete to export it"
+                f"{path}: session status is {status!r}; use --allow-incomplete to convert it"
             )
         episode = align_session(session, config.arms, options)
         for note in episode.notes:
-            print(f"[align] {Path(path).name}: {note}")
+            print(f"[align] {path.parent.name}/{path.name}: {note}")
         episodes.append(episode)
     result = export_dataset(episodes, config, Path(args.output))
     print(f"dataset: {result.root}")
     print(f"episodes: {result.episodes}, frames: {result.frames}")
     return 0
+
+
+def _session_paths(paths: list[str]) -> list[tuple[Path, bool]]:
+    """Expand run directories into their episode_N folders in numeric order."""
+    result: list[tuple[Path, bool]] = []
+    for path in map(Path, paths):
+        if (path / "meta.json").is_file():
+            result.append((path, False))
+            continue
+        episodes = [item for item in path.glob("episode_*") if item.name[8:].isdigit()]
+        if not episodes:
+            raise ValueError(f"{path}: neither an episode nor a run directory")
+        result.extend((item, True) for item in sorted(episodes, key=lambda p: int(p.name[8:])))
+    return result
 
 
 def _verify(args: argparse.Namespace) -> int:
@@ -96,31 +106,33 @@ def _doctor(args: argparse.Namespace) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dvrk-lerobot",
-        description="Record dVRK ROS 2 data and export LeRobot Dataset v2.1.",
+        description="Record dVRK ROS 2 data and convert it to LeRobot Dataset v2.1.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    record = subparsers.add_parser("record", help="record one raw session")
+    record = subparsers.add_parser(
+        "record", help="record episodes interactively: s = start, e = end, q = quit"
+    )
     _config_argument(record)
     record.add_argument("--root", default="data/raw", help="raw session root directory")
     record.add_argument("--task", required=True, help="task description stored in metadata")
-    record.add_argument("--operator", default="", help="optional operator name")
     record.add_argument("--notes", default="", help="optional free-form notes")
-    record.add_argument(
-        "--duration", type=float, default=0.0, help="seconds to record; 0 means until Ctrl+C"
-    )
 
-    export = subparsers.add_parser("export", help="export raw sessions to LeRobot v2.1")
-    _config_argument(export)
-    export.add_argument("--sessions", nargs="+", required=True, help="raw session directories")
-    export.add_argument("--output", required=True, help="new dataset directory")
-    export.add_argument(
+    convert = subparsers.add_parser(
+        "convert", help="align raw episodes in time and convert them to LeRobot v2.1"
+    )
+    _config_argument(convert)
+    convert.add_argument(
+        "--sessions", nargs="+", required=True, help="run directories and/or episode directories"
+    )
+    convert.add_argument("--output", required=True, help="new dataset directory")
+    convert.add_argument(
         "--allow-incomplete",
         action="store_true",
-        help="export sessions whose meta.json status is not 'ok'",
+        help="convert sessions whose meta.json status is not 'ok'",
     )
 
-    verify = subparsers.add_parser("verify", help="check an exported dataset")
+    verify = subparsers.add_parser("verify", help="check a converted dataset")
     verify.add_argument("--dataset", required=True, help="dataset root directory")
 
     doctor = subparsers.add_parser("doctor", help="check tools, cameras, and topics")

@@ -71,13 +71,14 @@ def _topic_check(config: AppConfig, timeout: float) -> bool:
     topics: list[str] = []
     try:
         for arm in config.arms:
-            topics.extend((arm.js_topic, arm.cp_topic))
-            node.create_subscription(
-                JointState,
-                arm.js_topic,
-                lambda message, topic=arm.js_topic: record(topic, message),
-                qos_profile_sensor_data,
-            )
+            topics.extend((arm.js_topic, arm.jaw_topic, arm.cp_topic))
+            for js_topic in (arm.js_topic, arm.jaw_topic):
+                node.create_subscription(
+                    JointState,
+                    js_topic,
+                    lambda message, topic=js_topic: record(topic, message),
+                    qos_profile_sensor_data,
+                )
             node.create_subscription(
                 PoseStamped,
                 arm.cp_topic,
