@@ -12,8 +12,7 @@ from dvrk_lerobot.acquire.session import Frame, RobotSample, Session
 from dvrk_lerobot.config import ArmConfig
 from dvrk_lerobot.dataset.schema import POSE_NAMES, state_names
 
-# Per-arm state blocks, in observation.state order.
-KINDS = ("jp", "jaw", "cp")
+KINDS = ("jp", "jaw", "cp")  # per-arm state blocks, in observation.state order
 
 
 @dataclass(frozen=True)
@@ -34,8 +33,9 @@ class Episode:
     state: np.ndarray
     action: np.ndarray
     timestamps: np.ndarray
-    left: list[Path]
-    right: list[Path]
+    videos: dict[str, Path]
+    left: list[int]
+    right: list[int]
     state_names: list[str]
     notes: list[str]
 
@@ -45,22 +45,20 @@ def align_session(session: Session, arms: Sequence[ArmConfig], options: AlignOpt
     recorded_fps = int(session.meta.get("fps", options.fps))
     if recorded_fps != options.fps:
         raise ValueError(
-            f"{session.root}: recorded at {recorded_fps} fps, export config uses {options.fps}"
+            f"{session.root}: recorded at {recorded_fps} fps, convert config uses {options.fps}"
         )
     tolerance_ns = round(options.stereo_tolerance_ms * 1_000_000)
     pairs = pair_frames(session.frames["left"], session.frames["right"], tolerance_ns)
     if len(pairs) < 2:
         raise ValueError(f"{session.root}: fewer than two stereo pairs")
 
-    joint_names = session.meta.get("joint_names", {})
-    names = state_names(arms, joint_names)
+    names = state_names(arms, session.meta.get("joint_names", {}))
     series = {arm.name: _arm_series(session.robot, arm.name) for arm in arms}
     robot_tolerance = round(options.robot_tolerance_ms * 1_000_000)
 
     rows: list[np.ndarray] = []
     capture_ns: list[int] = []
-    left_paths: list[Path] = []
-    right_paths: list[Path] = []
+    left_indices, right_indices = [], []
     skew_ns: list[int] = []
     missing_robot = 0
     for left, right in pairs:
@@ -68,26 +66,19 @@ def align_session(session: Session, arms: Sequence[ArmConfig], options: AlignOpt
         vector: list[np.ndarray] = []
         pair_skew = 0
         for arm in arms:
-            picked = []
-            for kind in KINDS:
-                times, values = series[arm.name][kind]
-                index = _nearest(times, timestamp, robot_tolerance)
-                if index is None:
-                    break
-                picked.append((int(times[index]), values[index]))
-            if len(picked) != len(KINDS):
+            found = [_pick(series[arm.name][kind], timestamp, robot_tolerance) for kind in KINDS]
+            if None in found:
                 vector = []
                 break
-            vector.extend(values for _, values in picked)
-            stamps = [stamp for stamp, _ in picked]
-            pair_skew = max(pair_skew, max(stamps) - min(stamps))
+            vector.extend(sample for _, sample in found)
+            pair_skew = max(pair_skew, int(np.ptp([stamp for stamp, _ in found])))
         if not vector:
             missing_robot += 1
             continue
         rows.append(np.concatenate(vector).astype(np.float32))
         capture_ns.append(timestamp)
-        left_paths.append(left.path)
-        right_paths.append(right.path)
+        left_indices.append(left.index)
+        right_indices.append(right.index)
         skew_ns.append(pair_skew)
 
     if len(rows) < 2:
@@ -110,8 +101,9 @@ def align_session(session: Session, arms: Sequence[ArmConfig], options: AlignOpt
         state=state,
         action=action,
         timestamps=timestamps,
-        left=left_paths,
-        right=right_paths,
+        videos=session.videos,
+        left=left_indices,
+        right=right_indices,
         state_names=names,
         notes=notes,
     )
@@ -161,6 +153,11 @@ def _arm_series(
 
 def _sample_time(sample: RobotSample) -> int:
     return sample.stamp_ns if sample.stamp_ns > 0 else sample.t_ns
+
+
+def _pick(series: tuple[np.ndarray, np.ndarray], target: int, tolerance: int):
+    index = _nearest(series[0], target, tolerance)
+    return None if index is None else (int(series[0][index]), series[1][index])
 
 
 def _nearest(times: np.ndarray, target: int, tolerance: int) -> int | None:
