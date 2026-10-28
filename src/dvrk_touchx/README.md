@@ -7,7 +7,7 @@ dVRK then solves the PSM inverse kinematics.
 
 ```text
  Touch X ──USB──► sawSensablePhantom ──/arm/measured_cp (500 Hz)──► dvrk-touchx ──/PSM1/servo_cp──────► dVRK PSM1
- (stylus,         (C++ 1 kHz haptic     /arm/button1, /arm/button2    retarget +    /PSM1/jaw/move_jp      (IK, joint
+ (stylus,         (C++ 1 kHz haptic     /arm/front, /arm/back          retarget +    /PSM1/jaw/servo_jp     (IK, joint
   2 buttons)       loop, ROS 2 bridge)                                safety        ◄─/PSM1/measured_cp    control)
 ```
 
@@ -15,7 +15,7 @@ dVRK then solves the PSM inverse kinematics.
 |---|---|---|
 | dVRK | `ros2 run dvrk_robot dvrk_system -j <system.json>` (`dvrk_console_json` on older dVRK) | Powers, homes and exposes PSM1 on ROS 2 |
 | TouchX driver | sawSensablePhantom ROS 2 node | Publishes the stylus pose and buttons |
-| Teleop | `./scripts/teleop.sh` | Hold button 1 to follow, hold button 2 to close the jaw |
+| Teleop | `./scripts/teleop.sh` | Hold the front button to follow, hold the back button to close the jaw |
 | Record (optional) | `./scripts/record.sh --task "..."` | Records demonstrations while you teleoperate |
 
 ---
@@ -43,12 +43,12 @@ The TouchX takes the place of the MTM:
 |---|---|
 | `MTM/local/measured_cp` | `/arm/measured_cp` from sawSensablePhantom (OpenHaptics frame: X right, Y up, Z toward the user) |
 | MTM `base_frame` in console.json | `rotation` in `configs/touchx.yaml` (TouchX to the frame of `/PSM1/measured_cp`) |
-| MTM gripper | Button 2 (held = closed) |
-| Clutch pedal and operator presence | Button 1 (held = following) |
+| MTM gripper | Back button (held = closed) |
+| Clutch pedal and operator presence | Front button (held = following) |
 
 ### 1.2 Retargeting
 
-When button 1 is pressed, the node records the TouchX pose `M0` (rotated into the
+When the front button is pressed, the node records the TouchX pose `M0` (rotated into the
 PSM frame) and the measured PSM pose `P0`. For every new TouchX sample `M`:
 
 ```text
@@ -62,7 +62,7 @@ This is the same relative mapping as `mtsTeleOperationPSM`:
 - Translation is scaled down (default 0.2, as in dVRK). Rotation is applied 1:1.
 - Only the base rotation matters. The base translation cancels out, and so does
   the convention of the stylus tip frame.
-- Releasing button 1 stops sending goals. dVRK holds the last goal, so the PSM
+- Releasing the front button stops sending goals. dVRK holds the last goal, so the PSM
   stays where it is. Move the stylus to a comfortable spot and press again,
   just like clutching on the MTM.
 
@@ -71,7 +71,7 @@ This is the same relative mapping as `mtsTeleOperationPSM`:
 | Topic | Type | When |
 |---|---|---|
 | `/PSM1/servo_cp` | `geometry_msgs/PoseStamped` | On every TouchX sample while following |
-| `/PSM1/jaw/move_jp` | `sensor_msgs/JointState` | On engage, and whenever button 2 changes while following |
+| `/PSM1/jaw/servo_jp` | `sensor_msgs/JointState` | With every `servo_cp`; moves toward `jaw_closed` (back button held) or `jaw_open` at up to 2π rad/s, starting from the measured jaw |
 
 The pose goes out inside the TouchX callback, with no extra control loop. The
 added latency is the driver's publish period (2 ms by default) plus a local DDS hop.
@@ -80,7 +80,7 @@ added latency is the driver's publish period (2 ms by default) plus a local DDS 
 
 Following stops (the log says `released: ...`) when:
 
-- button 1 is released;
+- the front button is released;
 - the goal is more than `max_error` (2 cm) from the measured PSM position. This
   also catches a PSM that is not following, or a driver that publishes
   millimetres instead of metres;
@@ -122,10 +122,10 @@ Start the sawSensablePhantom ROS 2 node (see its README for the exact command
 and configuration file). Then check its topics:
 
 ```bash
-ros2 topic list | grep button          # e.g. /arm/button1 /arm/button2
+ros2 topic list | grep -E "front|back"   # /arm/front /arm/back
 ros2 topic hz /arm/measured_cp         # about 500 Hz
 ros2 topic echo /arm/measured_cp       # positions should be in metres (|x| < 0.2)
-ros2 topic echo /arm/button1           # buttons: [1] while pressed
+ros2 topic echo /arm/front           # buttons: [1] while pressed
 ```
 
 The namespace (`/arm` above) is the device name in the driver configuration.
@@ -142,21 +142,21 @@ The script sources ROS 2 and the dVRK workspace (override with `ROS_SETUP` and
 `DVRK_SETUP`), then runs `dvrk-touchx`. Expected output:
 
 ```text
-[INFO] [dvrk_touchx_teleop]: ready: hold /arm/button1 to follow, button2 to close the jaw
+[INFO] [dvrk_touchx_teleop]: ready: hold /arm/front to follow, back to close the jaw
 [INFO] [dvrk_touchx_teleop]: following
 [INFO] [dvrk_touchx_teleop]: released: clutch released
 ```
 
 | Input | Action |
 |---|---|
-| Hold button 1 | PSM follows the stylus |
-| Release button 1 | PSM stops and holds; reposition your hand (clutch) |
-| Hold button 2 while following | Jaw closes to `jaw_closed` |
-| Release button 2 while following | Jaw opens to `jaw_open` |
+| Hold the front button | PSM follows the stylus |
+| Release the front button | PSM stops and holds; reposition your hand (clutch) |
+| Hold the back button while following | Jaw closes to `jaw_closed` |
+| Release the back button while following | Jaw opens to `jaw_open` |
 | `Ctrl+C` | Quit; the PSM holds its last goal |
 
-Button 2 is ignored while button 1 is released, so you can clutch without
-dropping what the jaw holds, as long as you keep button 2 pressed when you
+The back button is ignored while the front button is released, so you can clutch without
+dropping what the jaw holds, as long as you keep the back button pressed when you
 engage again.
 
 ### 3.4 Record demonstrations (optional)
@@ -178,7 +178,7 @@ second terminal. The rest of the pipeline is unchanged (see the main README):
 setup, with the instrument clear of anything:
 
 1. Set `scale: 0.1` in `configs/touchx.yaml` and start the teleop.
-2. Hold button 1 and move the stylus slowly **right**, **up**, then **away from
+2. Hold the front button and move the stylus slowly **right**, **up**, then **away from
    you**. Watching the endoscope view (or the PSM itself), the tool must move
    right, up, and deeper into the scene.
 3. Rotate the stylus a little about each axis; the tool must rotate the same way.
@@ -191,6 +191,17 @@ setup, with the instrument clear of anything:
 | OpenCV camera frame (e.g. from `dvrk_camera_registration`): X right, Y down, Z forward | `[[1,0,0],[0,-1,0],[0,0,-1]]` |
 | No PSM `base_frame` (RCM frame) | The RCM-to-user rotation for your mount, composed with the TouchX axes |
 
+If no row fits, fit `rotation` from your own movements, with the teleop stopped:
+
+```bash
+./scripts/calibrate_touchx.sh        # prompts for pairs, prints the rotation: block
+```
+
+It asks for six directions (right, left, up, down, toward you, away from you).
+For each, move the stylus 3-5 cm that way, then move the PSM tip (hand clutch on
+the arm) the same way. It prints both moves in mm so you can redo a wrong one,
+then how many degrees each move is off after the fit.
+
 `rotation` must be a proper rotation matrix (orthonormal, determinant +1);
 otherwise the config is rejected.
 
@@ -200,12 +211,12 @@ otherwise the config is rejected.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `touchx` | `/arm` | Driver namespace: `measured_cp`, `button1`, `button2` |
-| `psm` | `/PSM1` | PSM namespace: `measured_cp`, `servo_cp`, `jaw/move_jp` |
+| `touchx` | `/arm` | Driver namespace: `measured_cp`, `front`, `back` |
+| `psm` | `/PSM1` | PSM namespace: `measured_cp`, `servo_cp`, `jaw/servo_jp`, `jaw/measured_js` |
 | `rotation` | ISI convention | TouchX base frame, 3x3 rotation into the PSM frame |
 | `scale` | `0.2` | PSM translation per TouchX translation |
-| `jaw_open` | `0.8` | Jaw angle (rad) with button 2 released |
-| `jaw_closed` | `-0.2` | Jaw angle (rad) with button 2 held; negative adds grip force |
+| `jaw_open` | `0.8` | Jaw angle (rad) with the back button released |
+| `jaw_closed` | `-0.2` | Jaw angle (rad) with the back button held; negative adds grip force |
 | `max_error` | `0.02` | Release if the goal is farther than this from the PSM (m) |
 | `max_age` | `0.1` | Release or refuse to engage if PSM pose is older than this (s) |
 
@@ -220,7 +231,7 @@ and set `psm: /PSM2`.
 |---|---|
 | `cannot engage: no data on /arm/measured_cp` | Driver not running or wrong namespace. Check `ros2 topic list` and `touchx:` |
 | `cannot engage: no recent /PSM1/measured_cp` | dVRK not running, or wrong `psm:` |
-| Pressing button 1 does nothing, no log line | Wrong button topic, or the driver's button topic is not `sensor_msgs/Joy`. Check `ros2 topic echo /arm/button1` |
+| Pressing the front button does nothing, no log line | Wrong button topic, or the driver's button topic is not `sensor_msgs/Joy`. Check `ros2 topic echo /arm/front` |
 | `released: goal is X mm from the measured PSM position` right after a small move | Driver publishes millimetres, or the PSM is not enabled/homed and does not follow |
 | `released: goal is X mm ...` during fast motion | The PSM lags behind; move slower or raise `max_error` slightly |
 | `released: /PSM1/measured_cp is stale` | dVRK stopped publishing or the PC is overloaded |

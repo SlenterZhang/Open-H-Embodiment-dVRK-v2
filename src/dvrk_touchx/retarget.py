@@ -39,6 +39,20 @@ def matrix_to_quat(r: np.ndarray) -> np.ndarray:
     return q / np.linalg.norm(q)
 
 
+def fit_rotation(touch: np.ndarray, psm: np.ndarray) -> np.ndarray:
+    """Kabsch fit of R with R @ touch[i] ~ psm[i] (N x 3 displacements, N >= 2).
+
+    Each pair is normalized so it counts by direction only; scale is ignored.
+    """
+    a = touch / np.linalg.norm(touch, axis=1, keepdims=True)
+    b = psm / np.linalg.norm(psm, axis=1, keepdims=True)
+    u, s, vt = np.linalg.svd(a.T @ b)
+    if s[1] < 1e-2 * s[0]:
+        raise ValueError("need at least two non-parallel movements")
+    d = np.sign(np.linalg.det(vt.T @ u.T))
+    return vt.T @ np.diag([1.0, 1.0, d]) @ u.T
+
+
 class Retarget:
     """Relative mapping captured at engage time, as in dVRK mtsTeleOperationPSM.
 

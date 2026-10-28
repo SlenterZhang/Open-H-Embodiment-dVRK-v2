@@ -2,9 +2,9 @@
 # Disable the dVRK console teleop for this PSM first: only one node may command servo_cp.
 
 # ROS 2 namespace of the sawSensablePhantom driver (device name in its config).
-# Expected topics: <touchx>/measured_cp (PoseStamped, meters), <touchx>/button1, <touchx>/button2 (Joy).
+# Expected topics: <touchx>/measured_cp (PoseStamped, meters), <touchx>/front, <touchx>/back (Joy, stylus buttons).
 touchx: /arm
-# ROS 2 namespace of the PSM. Uses <psm>/measured_cp, <psm>/servo_cp, <psm>/jaw/move_jp.
+# ROS 2 namespace of the PSM. Uses <psm>/measured_cp, <psm>/servo_cp, <psm>/jaw/servo_jp, <psm>/jaw/measured_js.
 psm: /PSM1
 
 # TouchX base frame: maps TouchX coordinates into the frame of <psm>/measured_cp.
@@ -14,14 +14,17 @@ psm: /PSM1
 # PSM in an OpenCV camera frame (X right, Y down, Z forward): [[1,0,0],[0,-1,0],[0,0,-1]].
 # PSM without a base_frame (RCM frame): put the RCM orientation as seen by the user here.
 rotation:
-  - [-1.0, 0.0, 0.0]
-  - [0.0, 1.0, 0.0]
-  - [0.0, 0.0, -1.0]
+  - [-0.863504047, -0.478494314, 0.159386173]
+  - [-0.094233427, 0.463534713, 0.881053705]
+  - [-0.495460212, 0.745773935, -0.445354260]
+  # - [-1.0, 0.0, 0.0]
+  # - [0.0, 1.0, 0.0]
+  # - [0.0, 0.0, -1.0]
 
 # PSM translation = scale * TouchX translation (dVRK MTM->PSM default is 0.2).
 scale: 0.2
 
-# Jaw angles in radians sent on <psm>/jaw/move_jp. Negative closed angle adds grip force.
+# Jaw angles in radians sent on <psm>/jaw/servo_jp. Negative closed angle adds grip force.
 jaw_open: 0.8
 jaw_closed: -0.2
 
