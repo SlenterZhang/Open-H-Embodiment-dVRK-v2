@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     rclpy.init()
     node = TouchXTeleop(config)
     node.get_logger().info(
-        f"ready: hold {config.touchx}/front to follow, back to close the jaw"
+        f"ready: hold {config.touchx}/front to follow, press back to open/close the jaw"
     )
     try:
         rclpy.spin(node)

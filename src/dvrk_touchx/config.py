@@ -21,11 +21,13 @@ class TeleopConfig:
     touchx: str
     psm: str
     rotation: tuple[tuple[float, ...], ...]
+    tip_rotation: tuple[tuple[float, ...], ...]
     scale: float
     jaw_open: float
     jaw_closed: float
     max_error: float
     max_age: float
+    align_rate: float
 
 
 def load_config(path: str | Path) -> TeleopConfig:
@@ -45,12 +47,9 @@ def parse_config(raw: Any) -> TeleopConfig:
         raise ConfigError(
             f"missing keys {sorted(expected - set(raw))}, unknown keys {sorted(set(raw) - expected)}"
         )
-    rotation = np.asarray(raw["rotation"], dtype=float)
-    if rotation.shape != (3, 3):
-        raise ConfigError("rotation must be a 3x3 matrix")
-    if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6) or np.linalg.det(rotation) < 0:
-        raise ConfigError("rotation must be a proper rotation (orthonormal, det +1)")
-    for key in ("scale", "max_error", "max_age"):
+    rotation = _rotation(raw, "rotation")
+    tip_rotation = _rotation(raw, "tip_rotation")
+    for key in ("scale", "max_error", "max_age", "align_rate"):
         if float(raw[key]) <= 0:
             raise ConfigError(f"{key} must be positive")
     if float(raw["jaw_closed"]) >= float(raw["jaw_open"]):
@@ -59,9 +58,20 @@ def parse_config(raw: Any) -> TeleopConfig:
         touchx=str(raw["touchx"]).rstrip("/"),
         psm=str(raw["psm"]).rstrip("/"),
         rotation=tuple(tuple(row) for row in rotation.tolist()),
+        tip_rotation=tuple(tuple(row) for row in tip_rotation.tolist()),
         scale=float(raw["scale"]),
         jaw_open=float(raw["jaw_open"]),
         jaw_closed=float(raw["jaw_closed"]),
         max_error=float(raw["max_error"]),
         max_age=float(raw["max_age"]),
+        align_rate=float(raw["align_rate"]),
     )
+
+
+def _rotation(raw: dict, key: str) -> np.ndarray:
+    rotation = np.asarray(raw[key], dtype=float)
+    if rotation.shape != (3, 3):
+        raise ConfigError(f"{key} must be a 3x3 matrix")
+    if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6) or np.linalg.det(rotation) < 0:
+        raise ConfigError(f"{key} must be a proper rotation (orthonormal, det +1)")
+    return rotation

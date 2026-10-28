@@ -21,8 +21,16 @@ rotation:
   # - [0.0, 1.0, 0.0]
   # - [0.0, 0.0, -1.0]
 
+# Stylus tip frame -> PSM tool tip frame: tool orientation = rotation * R_stylus * tip_rotation.
+# Stylus pen points along -z (sawSensablePhantom tip = -39 mm * z), the tool tip along +z.
+# Default flips z. The roll about the tool axis is set at the first engage.
+tip_rotation:
+  - [1.0, 0.0, 0.0]
+  - [0.0, -1.0, 0.0]
+  - [0.0, 0.0, -1.0]
+
 # PSM translation = scale * TouchX translation (dVRK MTM->PSM default is 0.2).
-scale: 0.2
+scale: 0.8
 
 # Jaw angles in radians sent on <psm>/jaw/servo_jp. Negative closed angle adds grip force.
 jaw_open: 0.8
@@ -33,3 +41,5 @@ jaw_closed: -0.2
 max_error: 0.02
 # Stop following if <psm>/measured_cp is older than this (s).
 max_age: 0.1
+# On engage the tool turns to the stylus orientation at this speed (rad/s), then follows it.
+align_rate: 1.0
