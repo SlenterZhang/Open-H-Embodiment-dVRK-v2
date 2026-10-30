@@ -43,3 +43,5 @@ max_error: 0.02
 max_age: 0.1
 # On engage the tool turns to the stylus orientation at this speed (rad/s), then follows it.
 align_rate: 1.0
+# Once aligned, the tool turns by orientation_scale times the stylus rotation (1.0 = same as the stylus).
+orientation_scale: 1.0

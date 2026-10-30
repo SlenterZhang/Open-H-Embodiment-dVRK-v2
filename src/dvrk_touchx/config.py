@@ -28,6 +28,7 @@ class TeleopConfig:
     max_error: float
     max_age: float
     align_rate: float
+    orientation_scale: float
 
 
 def load_config(path: str | Path) -> TeleopConfig:
@@ -49,7 +50,7 @@ def parse_config(raw: Any) -> TeleopConfig:
         )
     rotation = _rotation(raw, "rotation")
     tip_rotation = _rotation(raw, "tip_rotation")
-    for key in ("scale", "max_error", "max_age", "align_rate"):
+    for key in ("scale", "max_error", "max_age", "align_rate", "orientation_scale"):
         if float(raw[key]) <= 0:
             raise ConfigError(f"{key} must be positive")
     if float(raw["jaw_closed"]) >= float(raw["jaw_open"]):
@@ -65,6 +66,7 @@ def parse_config(raw: Any) -> TeleopConfig:
         max_error=float(raw["max_error"]),
         max_age=float(raw["max_age"]),
         align_rate=float(raw["align_rate"]),
+        orientation_scale=float(raw["orientation_scale"]),
     )
 
 

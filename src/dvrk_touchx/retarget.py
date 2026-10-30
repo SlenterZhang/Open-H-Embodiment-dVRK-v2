@@ -75,15 +75,21 @@ class Retarget:
     command frame (display/camera frame in dVRK terms). Translation is scaled from
     the engage pose; the tool orientation equals the stylus orientation times `tip`
     times a roll about the tool axis, set at the first engage to the current tool roll.
-    It is reached from the engage orientation at `align_rate` (rad/s) first.
+    It is reached from the engage orientation at `align_rate` (rad/s) first; after that
+    the tool turns by `orientation_scale` times the stylus rotation since alignment.
     """
 
-    def __init__(self, rotation: np.ndarray, tip: np.ndarray, scale: float, align_rate: float) -> None:
+    def __init__(
+        self, rotation: np.ndarray, tip: np.ndarray, scale: float, align_rate: float,
+        orientation_scale: float = 1.0,
+    ) -> None:
         self.rotation = np.asarray(rotation, dtype=float)
         self.tip = np.asarray(tip, dtype=float)
         self.scale = scale
         self.align_rate = align_rate
+        self.orientation_scale = orientation_scale
         self.aligned = False
+        self._anchor: np.ndarray | None = None  # stylus target when aligned
         self._touch0: np.ndarray | None = None
         self._psm0: np.ndarray | None = None
         self._orientation: np.ndarray | None = None
@@ -120,5 +126,9 @@ class Retarget:
                 target = self._orientation @ _rotation(axis, step)
             else:
                 self.aligned = True
+                self._anchor = target
+        else:
+            axis, angle = _axis_angle(target @ self._anchor.T)
+            target = _rotation(axis, self.orientation_scale * angle) @ self._anchor
         self._orientation = target
         return position, target

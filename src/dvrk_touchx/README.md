@@ -232,6 +232,7 @@ otherwise the config is rejected.
 | `max_error` | `0.02` | Release if the goal is farther than this from the PSM (m) |
 | `max_age` | `0.1` | Release or refuse to engage if PSM pose is older than this (s) |
 | `align_rate` | `1.0` | Tool rotation speed (rad/s) on engage until it matches the stylus |
+| `orientation_scale` | `1.0` | Once aligned, tool rotation per stylus rotation (below 1 = finer, above 1 = larger) |
 
 All keys are required; unknown keys are rejected. To drive PSM2, copy the file
 and set `psm: /PSM2`.

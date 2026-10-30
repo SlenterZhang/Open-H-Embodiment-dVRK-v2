@@ -37,7 +37,8 @@ class TouchXTeleop(Node):
         super().__init__("dvrk_touchx_teleop")
         self.config = config
         self.retarget = Retarget(
-            np.array(config.rotation), np.array(config.tip_rotation), config.scale, config.align_rate
+            np.array(config.rotation), np.array(config.tip_rotation), config.scale, config.align_rate,
+            config.orientation_scale,
         )
         self._touch: Pose | None = None
         self._psm: Pose | None = None

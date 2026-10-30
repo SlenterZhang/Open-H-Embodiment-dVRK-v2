@@ -87,6 +87,17 @@ def test_orientation_turns_to_stylus_at_align_rate_then_is_absolute(offset):
     assert np.allclose(rotation, ISI @ turned[1] @ tip @ roll)
 
 
+def test_orientation_scale_scales_rotation_after_alignment():
+    retarget = Retarget(ISI, np.eye(3), 0.2, 1.0, orientation_scale=0.5)
+    touch = (np.zeros(3), np.eye(3))
+    retarget.engage(touch, (np.zeros(3), ISI))
+    _, aligned = retarget.goal(touch, 0.01)
+    assert retarget.aligned
+    _, rotation = retarget.goal((np.zeros(3), _rx(0.6)), 0.01)
+    assert np.isclose(_angle(aligned, rotation), 0.3)
+    assert np.allclose(rotation, ISI @ _rx(0.3) @ ISI.T @ aligned)
+
+
 def test_goal_requires_engage():
     retarget = Retarget(ISI, np.eye(3), 0.2, 1.0)
     with pytest.raises(RuntimeError):
@@ -134,6 +145,7 @@ def test_shipped_config_parses():
         ("rotation", [[1, 0], [0, 1]]),
         ("tip_rotation", [[1, 0, 0], [0, 1, 0], [0, 0, -1]]),
         ("align_rate", 0),
+        ("orientation_scale", 0),
         ("scale", 0),
         ("jaw_closed", 1.0),
     ],
