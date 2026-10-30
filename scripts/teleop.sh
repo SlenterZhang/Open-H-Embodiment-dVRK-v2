@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Teleoperate a PSM with the TouchX (hold the front button to follow, the back button to close the jaw).
+# Teleoperate a PSM with the TouchX (hold the front button to follow, press the back button to open/close the jaw).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 set +u

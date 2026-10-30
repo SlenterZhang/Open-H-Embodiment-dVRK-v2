@@ -53,44 +53,82 @@ def fit_rotation(touch: np.ndarray, psm: np.ndarray) -> np.ndarray:
     return vt.T @ np.diag([1.0, 1.0, d]) @ u.T
 
 
+def _axis_angle(r: np.ndarray) -> tuple[np.ndarray, float]:
+    """Unit axis and angle (rad) of a rotation matrix."""
+    angle = float(np.arccos(np.clip((np.trace(r) - 1) / 2, -1.0, 1.0)))
+    axis = np.array([r[2, 1] - r[1, 2], r[0, 2] - r[2, 0], r[1, 0] - r[0, 1]])
+    if np.linalg.norm(axis) < 1e-9:  # 0 or pi: (r + I) / 2 = axis axis^T at pi
+        b = (r + np.eye(3)) / 2
+        axis = b[:, np.argmax(np.diag(b))]
+    return axis / np.linalg.norm(axis), angle
+
+
+def _rotation(axis: np.ndarray, angle: float) -> np.ndarray:
+    k = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+    return np.eye(3) + np.sin(angle) * k + (1 - np.cos(angle)) * k @ k
+
+
 class Retarget:
-    """Relative mapping captured at engage time, as in dVRK mtsTeleOperationPSM.
+    """Relative position, absolute orientation, as in dVRK mtsTeleOperationPSM.
 
     `rotation` is the TouchX base frame: it maps TouchX coordinates into the PSM
-    command frame (display/camera frame in dVRK terms). Translation is scaled;
-    orientation changes are applied 1:1 in that common frame.
+    command frame (display/camera frame in dVRK terms). Translation is scaled from
+    the engage pose; the tool orientation equals the stylus orientation times `tip`
+    times a roll about the tool axis, set at the first engage to the current tool roll.
+    It is reached from the engage orientation at `align_rate` (rad/s) first; after that
+    the tool turns by `orientation_scale` times the stylus rotation since alignment.
     """
 
-    def __init__(self, rotation: np.ndarray, scale: float) -> None:
+    def __init__(
+        self, rotation: np.ndarray, tip: np.ndarray, scale: float, align_rate: float,
+        orientation_scale: float = 1.0,
+    ) -> None:
         self.rotation = np.asarray(rotation, dtype=float)
+        self.tip = np.asarray(tip, dtype=float)
         self.scale = scale
-        self._touch0: Pose | None = None
-        self._psm0: Pose | None = None
+        self.align_rate = align_rate
+        self.orientation_scale = orientation_scale
+        self.aligned = False
+        self._anchor: np.ndarray | None = None  # stylus target when aligned
+        self._touch0: np.ndarray | None = None
+        self._psm0: np.ndarray | None = None
+        self._orientation: np.ndarray | None = None
+        self._roll: np.ndarray | None = None  # kept across clutches
 
     @property
     def engaged(self) -> bool:
         return self._touch0 is not None
 
     def engage(self, touch: Pose, psm: Pose) -> None:
-        """Capture the TouchX and PSM start poses; the PSM goal starts at `psm`."""
-        self._touch0 = self._to_common(touch)
-        self._psm0 = psm
+        """Capture the start poses; the goal starts at `psm` and turns toward the stylus."""
+        self._touch0 = self.rotation @ touch[0]
+        self._psm0 = psm[0]
+        self._orientation = psm[1]
+        self.aligned = False
+        if self._roll is None:
+            m = (self.rotation @ touch[1] @ self.tip).T @ psm[1]
+            self._roll = _rotation(np.array([0.0, 0.0, 1.0]), np.arctan2(m[1, 0] - m[0, 1], m[0, 0] + m[1, 1]))
 
     def release(self) -> None:
         self._touch0 = None
         self._psm0 = None
 
-    def goal(self, touch: Pose) -> Pose:
-        """PSM goal: p = p0 + s * dp, R = (R_touch * R_touch0^T) * R_psm0."""
+    def goal(self, touch: Pose, dt: float) -> Pose:
+        """PSM goal: p = p0 + s * dp, R -> rotation * R_touch * tip * roll (rate limited until aligned)."""
         if self._touch0 is None or self._psm0 is None:
             raise RuntimeError("retarget is not engaged")
-        position, rotation = self._to_common(touch)
-        position0, rotation0 = self._touch0
-        psm_position, psm_rotation = self._psm0
-        goal_position = psm_position + self.scale * (position - position0)
-        goal_rotation = rotation @ rotation0.T @ psm_rotation
-        return goal_position, goal_rotation
-
-    def _to_common(self, touch: Pose) -> Pose:
-        position, rotation = touch
-        return self.rotation @ position, self.rotation @ rotation
+        position = self._psm0 + self.scale * (self.rotation @ touch[0] - self._touch0)
+        target = self.rotation @ touch[1] @ self.tip @ self._roll
+        if not self.aligned:
+            axis, angle = _axis_angle(self._orientation.T @ target)
+            step = self.align_rate * dt
+            if angle > step:
+                target = self._orientation @ _rotation(axis, step)
+            else:
+                self.aligned = True
+                self._anchor = target
+        else:
+            axis, angle = _axis_angle(target @ self._anchor.T)
+            target = _rotation(axis, self.orientation_scale * angle) @ self._anchor
+        self._orientation = target
+        return position, target

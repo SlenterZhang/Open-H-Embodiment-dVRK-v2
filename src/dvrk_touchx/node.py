@@ -23,24 +23,30 @@ def pose_from_msg(message: PoseStamped) -> Pose:
 
 
 class TouchXTeleop(Node):
-    """Button 1 held: PSM follows the TouchX. Button 2 held: jaw closes.
+    """Button 1 held: PSM follows the TouchX (tool turns to the stylus orientation first).
+    Button 2 pressed: jaw toggles open/closed.
 
     Every TouchX sample (500 Hz from sawSensablePhantom) is retargeted and sent
     on servo_cp right away, with the jaw on jaw/servo_jp (jaw/move_jp would be
-    cancelled by the next servo_cp); dVRK solves the PSM IK. Following stops when the
-    goal drifts more than `max_error` from the measured PSM position.
+    cancelled by the next servo_cp); dVRK solves the PSM IK. The jaw also moves while
+    not following. Following stops when the goal drifts more than `max_error` from the
+    measured PSM position.
     """
 
     def __init__(self, config: TeleopConfig) -> None:
         super().__init__("dvrk_touchx_teleop")
         self.config = config
-        self.retarget = Retarget(np.array(config.rotation), config.scale)
+        self.retarget = Retarget(
+            np.array(config.rotation), np.array(config.tip_rotation), config.scale, config.align_rate,
+            config.orientation_scale,
+        )
         self._touch: Pose | None = None
         self._psm: Pose | None = None
         self._psm_time = 0.0
         self._clutch = False
+        self._back = False
         self._jaw_closed = False
-        self._jaw: float | None = None  # last jaw goal while following
+        self._jaw: float | None = None  # last jaw goal
         self._jaw_measured: float | None = None
         self._touch_time = 0.0
         self._frame_id = ""
@@ -74,19 +80,30 @@ class TouchXTeleop(Node):
         now = time.monotonic()
         dt, self._touch_time = now - self._touch_time, now
         if not self.retarget.engaged:
+            # Ramp a toggled jaw to its target, then stop sending.
+            if self._jaw is not None and self._jaw != self._jaw_target():
+                self._step_jaw(dt)
             return
         if time.monotonic() - self._psm_time > self.config.max_age:
             self._release(f"{self.config.psm}/measured_cp is stale")
             return
-        position, rotation = self.retarget.goal(self._touch)
+        aligned = self.retarget.aligned
+        position, rotation = self.retarget.goal(self._touch, min(dt, 0.01))
+        if self.retarget.aligned and not aligned:
+            self.get_logger().info("tool aligned with the stylus")
         error = float(np.linalg.norm(position - self._psm[0]))
         if error > self.config.max_error:
             self._release(f"goal is {error * 1000:.1f} mm from the measured PSM position")
             return
         self._send_cp(position, rotation)
-        target = self.config.jaw_closed if self._jaw_closed else self.config.jaw_open
+        self._step_jaw(dt)
+
+    def _jaw_target(self) -> float:
+        return self.config.jaw_closed if self._jaw_closed else self.config.jaw_open
+
+    def _step_jaw(self, dt: float) -> None:
         step = JAW_RATE * min(dt, 0.01)
-        self._jaw += float(np.clip(target - self._jaw, -step, step))
+        self._jaw += float(np.clip(self._jaw_target() - self._jaw, -step, step))
         self._send_jaw()
 
     def _on_clutch(self, message: Joy) -> None:
@@ -100,9 +117,21 @@ class TouchXTeleop(Node):
             self._release("clutch released")
 
     def _on_jaw(self, message: Joy) -> None:
-        closed = bool(message.buttons) and message.buttons[0] == 1
-        # Applied on the next TouchX sample while following.
-        self._jaw_closed = closed
+        pressed = bool(message.buttons) and message.buttons[0] == 1
+        if pressed == self._back:
+            return
+        self._back = pressed
+        if not pressed:
+            return
+        if self._jaw_measured is None:
+            self.get_logger().warning(f"cannot move jaw: no data on {self.config.psm}/jaw/measured_js")
+            return
+        self._jaw_closed = not self._jaw_closed
+        if not self.retarget.engaged:
+            # Start from the measured jaw so it ramps instead of jumping.
+            self._jaw = self._jaw_measured
+        # Applied on the next TouchX sample.
+        self.get_logger().info("jaw closing" if self._jaw_closed else "jaw opening")
 
     def _engage(self) -> None:
         if self._touch is None:
@@ -117,7 +146,7 @@ class TouchXTeleop(Node):
         self.retarget.engage(self._touch, self._psm)
         # Start from the measured jaw so it ramps instead of jumping.
         self._jaw = self._jaw_measured
-        self.get_logger().info("following")
+        self.get_logger().info("following, aligning the tool with the stylus")
 
     def _release(self, reason: str) -> None:
         # dVRK holds the last servo_cp goal, so the PSM stops where it is.

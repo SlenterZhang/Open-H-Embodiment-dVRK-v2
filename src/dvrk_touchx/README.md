@@ -15,7 +15,7 @@ dVRK then solves the PSM inverse kinematics.
 |---|---|---|
 | dVRK | `ros2 run dvrk_robot dvrk_system -j <system.json>` (`dvrk_console_json` on older dVRK) | Powers, homes and exposes PSM1 on ROS 2 |
 | TouchX driver | sawSensablePhantom ROS 2 node | Publishes the stylus pose and buttons |
-| Teleop | `./scripts/teleop.sh` | Hold the front button to follow, hold the back button to close the jaw |
+| Teleop | `./scripts/teleop.sh` | Hold the front button to follow, press the back button to open/close the jaw |
 | Record (optional) | `./scripts/record.sh --task "..."` | Records demonstrations while you teleoperate |
 
 ---
@@ -43,25 +43,31 @@ The TouchX takes the place of the MTM:
 |---|---|
 | `MTM/local/measured_cp` | `/arm/measured_cp` from sawSensablePhantom (OpenHaptics frame: X right, Y up, Z toward the user) |
 | MTM `base_frame` in console.json | `rotation` in `configs/touchx.yaml` (TouchX to the frame of `/PSM1/measured_cp`) |
-| MTM gripper | Back button (held = closed) |
+| MTM gripper | Back button (each press toggles open/closed) |
 | Clutch pedal and operator presence | Front button (held = following) |
 
 ### 1.2 Retargeting
 
-When the front button is pressed, the node records the TouchX pose `M0` (rotated into the
+When the front button is pressed, the node records the TouchX position `p_M0` (rotated into the
 PSM frame) and the measured PSM pose `P0`. For every new TouchX sample `M`:
 
 ```text
 p_goal = p_P0 + scale · (p_M − p_M0)
-R_goal = R_M · R_M0ᵀ · R_P0
+R_goal = R_M · tip_rotation        (R_M rotated into the PSM frame)
 ```
 
-This is the same relative mapping as `mtsTeleOperationPSM`:
+Position is relative and orientation is absolute, as in `mtsTeleOperationPSM`: the tool
+tip, as seen on the camera view, points the way the stylus points as seen by you.
 
-- The first goal equals the current PSM pose, so the PSM never jumps on engage.
-- Translation is scaled down (default 0.2, as in dVRK). Rotation is applied 1:1.
-- Only the base rotation matters. The base translation cancels out, and so does
-  the convention of the stylus tip frame.
+- The first goal equals the current PSM pose. The tool then turns to the stylus
+  orientation at `align_rate` (1 rad/s), and follows it directly once aligned
+  (the log says `tool aligned with the stylus`). The position never jumps.
+- Translation is scaled down (default 0.2, as in dVRK).
+- The base translation cancels out. `tip_rotation` maps the stylus tip frame to
+  the tool tip frame (see section 4).
+- The roll about the tool axis is taken at the first engage so the shaft does not
+  twist toward its limit, then kept until the teleop restarts. Only the pointing
+  direction is absolute from the start.
 - Releasing the front button stops sending goals. dVRK holds the last goal, so the PSM
   stays where it is. Move the stylus to a comfortable spot and press again,
   just like clutching on the MTM.
@@ -71,7 +77,7 @@ This is the same relative mapping as `mtsTeleOperationPSM`:
 | Topic | Type | When |
 |---|---|---|
 | `/PSM1/servo_cp` | `geometry_msgs/PoseStamped` | On every TouchX sample while following |
-| `/PSM1/jaw/servo_jp` | `sensor_msgs/JointState` | With every `servo_cp`; moves toward `jaw_closed` (back button held) or `jaw_open` at up to 2π rad/s, starting from the measured jaw |
+| `/PSM1/jaw/servo_jp` | `sensor_msgs/JointState` | With every `servo_cp`; moves toward `jaw_closed` or `jaw_open` (toggled by the back button) at up to 2π rad/s, starting from the measured jaw; while not following, only until the target is reached |
 
 The pose goes out inside the TouchX callback, with no extra control loop. The
 added latency is the driver's publish period (2 ms by default) plus a local DDS hop.
@@ -142,22 +148,21 @@ The script sources ROS 2 and the dVRK workspace (override with `ROS_SETUP` and
 `DVRK_SETUP`), then runs `dvrk-touchx`. Expected output:
 
 ```text
-[INFO] [dvrk_touchx_teleop]: ready: hold /arm/front to follow, back to close the jaw
-[INFO] [dvrk_touchx_teleop]: following
+[INFO] [dvrk_touchx_teleop]: ready: hold /arm/front to follow, press back to open/close the jaw
+[INFO] [dvrk_touchx_teleop]: following, aligning the tool with the stylus
+[INFO] [dvrk_touchx_teleop]: tool aligned with the stylus
 [INFO] [dvrk_touchx_teleop]: released: clutch released
 ```
 
 | Input | Action |
 |---|---|
-| Hold the front button | PSM follows the stylus |
+| Hold the front button | Tool turns to the stylus orientation, then follows the stylus |
 | Release the front button | PSM stops and holds; reposition your hand (clutch) |
-| Hold the back button while following | Jaw closes to `jaw_closed` |
-| Release the back button while following | Jaw opens to `jaw_open` |
+| Press the back button | Jaw toggles between `jaw_open` and `jaw_closed` |
 | `Ctrl+C` | Quit; the PSM holds its last goal |
 
-The back button is ignored while the front button is released, so you can clutch without
-dropping what the jaw holds, as long as you keep the back button pressed when you
-engage again.
+The back button works with or without the front button held, and the jaw keeps its
+state while you clutch, so you do not drop what it holds. The jaw starts open.
 
 ### 3.4 Record demonstrations (optional)
 
@@ -181,7 +186,8 @@ setup, with the instrument clear of anything:
 2. Hold the front button and move the stylus slowly **right**, **up**, then **away from
    you**. Watching the endoscope view (or the PSM itself), the tool must move
    right, up, and deeper into the scene.
-3. Rotate the stylus a little about each axis; the tool must rotate the same way.
+3. Rotate the stylus a little about each axis; the tool must rotate the same way and,
+   once aligned, point the same way as the stylus.
 4. If an axis is mirrored or swapped, pick the matching `rotation` below,
    restart, and repeat.
 
@@ -190,6 +196,11 @@ setup, with the instrument clear of anything:
 | ISI display/camera convention: X left, Y up, Z away (default) | `[[-1,0,0],[0,1,0],[0,0,-1]]` |
 | OpenCV camera frame (e.g. from `dvrk_camera_registration`): X right, Y down, Z forward | `[[1,0,0],[0,-1,0],[0,0,-1]]` |
 | No PSM `base_frame` (RCM frame) | The RCM-to-user rotation for your mount, composed with the TouchX axes |
+
+`tip_rotation` needs no calibration. The stylus pen points along −z of its frame
+(sawSensablePhantom puts the tip at −39 mm along z) and the tool tip along +z, so the
+default `[[1,0,0],[0,-1,0],[0,0,-1]]` flips z. The roll between the stylus buttons and the
+jaws is set automatically at the first engage.
 
 If no row fits, fit `rotation` from your own movements, with the teleop stopped:
 
@@ -214,11 +225,14 @@ otherwise the config is rejected.
 | `touchx` | `/arm` | Driver namespace: `measured_cp`, `front`, `back` |
 | `psm` | `/PSM1` | PSM namespace: `measured_cp`, `servo_cp`, `jaw/servo_jp`, `jaw/measured_js` |
 | `rotation` | ISI convention | TouchX base frame, 3x3 rotation into the PSM frame |
+| `tip_rotation` | z flipped | Stylus tip frame to tool tip frame, 3x3 rotation |
 | `scale` | `0.2` | PSM translation per TouchX translation |
-| `jaw_open` | `0.8` | Jaw angle (rad) with the back button released |
-| `jaw_closed` | `-0.2` | Jaw angle (rad) with the back button held; negative adds grip force |
+| `jaw_open` | `0.8` | Jaw angle (rad) when open (initial state) |
+| `jaw_closed` | `-0.2` | Jaw angle (rad) when closed; negative adds grip force |
 | `max_error` | `0.02` | Release if the goal is farther than this from the PSM (m) |
 | `max_age` | `0.1` | Release or refuse to engage if PSM pose is older than this (s) |
+| `align_rate` | `1.0` | Tool rotation speed (rad/s) on engage until it matches the stylus |
+| `orientation_scale` | `1.0` | Once aligned, tool rotation per stylus rotation (below 1 = finer, above 1 = larger) |
 
 All keys are required; unknown keys are rejected. To drive PSM2, copy the file
 and set `psm: /PSM2`.
