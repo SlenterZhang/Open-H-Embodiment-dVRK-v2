@@ -1,4 +1,4 @@
-"""Align raw robot samples and stereo frames into fixed-rate episodes."""
+"""Place raw robot samples and stereo frames on one fixed-rate slot grid."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dvrk_lerobot.acquire.session import Frame, RobotSample, Session
+from dvrk_lerobot.acquire.session import SIDES, RobotSample, Session
 from dvrk_lerobot.config import ArmConfig
 from dvrk_lerobot.dataset.schema import POSE_NAMES, state_names
 
@@ -17,7 +17,7 @@ KINDS = ("jp", "jaw", "cp")  # per-arm state blocks, in observation.state order
 
 @dataclass(frozen=True)
 class AlignOptions:
-    """Target rate and matching tolerances."""
+    """Target rate and the tolerances the alignment report counts against."""
 
     fps: int
     stereo_tolerance_ms: float
@@ -41,49 +41,33 @@ class Episode:
 
 
 def align_session(session: Session, arms: Sequence[ArmConfig], options: AlignOptions) -> Episode:
-    """Pair stereo frames, attach nearest robot state, and build actions."""
+    """Fill every grid slot with both eyes and the held robot state; rows are never removed."""
     recorded_fps = int(session.meta.get("fps", options.fps))
     if recorded_fps != options.fps:
         raise ValueError(
             f"{session.root}: recorded at {recorded_fps} fps, convert config uses {options.fps}"
         )
-    tolerance_ns = round(options.stereo_tolerance_ms * 1_000_000)
-    pairs = pair_frames(session.frames["left"], session.frames["right"], tolerance_ns)
-    if len(pairs) < 2:
-        raise ValueError(f"{session.root}: fewer than two stereo pairs")
+    slot_ns = round(1e9 / options.fps)
+    times = {
+        side: np.array([frame.ts_ns for frame in session.frames[side]], dtype=np.int64)
+        for side in SIDES
+    }
+    grid = slot_grid(times["left"], times["right"], slot_ns)
+    if len(grid) < 2:
+        raise ValueError(f"{session.root}: fewer than two grid slots")
+    placed = {side: place_frames(times[side], grid, slot_ns) for side in SIDES}
 
     names = state_names(arms, session.meta.get("joint_names", {}))
-    series = {arm.name: _arm_series(session.robot, arm.name) for arm in arms}
-    robot_tolerance = round(options.robot_tolerance_ms * 1_000_000)
-
-    rows: list[np.ndarray] = []
-    capture_ns: list[int] = []
-    left_indices, right_indices = [], []
-    skew_ns: list[int] = []
-    missing_robot = 0
-    for left, right in pairs:
-        timestamp = (left.ts_ns + right.ts_ns) // 2
-        vector: list[np.ndarray] = []
-        pair_skew = 0
-        for arm in arms:
-            found = [_pick(series[arm.name][kind], timestamp, robot_tolerance) for kind in KINDS]
-            if None in found:
-                vector = []
-                break
-            vector.extend(sample for _, sample in found)
-            pair_skew = max(pair_skew, int(np.ptp([stamp for stamp, _ in found])))
-        if not vector:
-            missing_robot += 1
-            continue
-        rows.append(np.concatenate(vector).astype(np.float32))
-        capture_ns.append(timestamp)
-        left_indices.append(left.index)
-        right_indices.append(right.index)
-        skew_ns.append(pair_skew)
-
-    if len(rows) < 2:
-        raise ValueError(f"{session.root}: fewer than two aligned frames")
-    state = np.stack(rows, axis=0)
+    blocks: list[np.ndarray] = []
+    ages: list[np.ndarray] = []
+    for arm in arms:
+        series = _arm_series(session.robot, arm.name)
+        for kind in KINDS:
+            stamps, values = series[kind]
+            index = hold_last_index(stamps, grid)
+            blocks.append(values[index])
+            ages.append(np.abs(grid - stamps[index]))
+    state = np.concatenate(blocks, axis=1).astype(np.float32)
     if state.shape[1] != len(names):
         raise ValueError(
             f"{session.root}: state has {state.shape[1]} values but {len(names)} names"
@@ -92,9 +76,6 @@ def align_session(session: Session, arms: Sequence[ArmConfig], options: AlignOpt
         raise ValueError(f"{session.root}: non-finite robot state")
     action = np.concatenate((state[1:], state[-1:]), axis=0)
     timestamps = (np.arange(len(state), dtype=np.float64) / options.fps).astype(np.float32)
-    notes = _notes(
-        len(session.frames["left"]), pairs, missing_robot, capture_ns, skew_ns, options.fps
-    )
     return Episode(
         session=session.root,
         task=session.task,
@@ -102,48 +83,49 @@ def align_session(session: Session, arms: Sequence[ArmConfig], options: AlignOpt
         action=action,
         timestamps=timestamps,
         videos=session.videos,
-        left=left_indices,
-        right=right_indices,
+        left=[session.frames["left"][position].index for position in placed["left"][0]],
+        right=[session.frames["right"][position].index for position in placed["right"][0]],
         state_names=names,
-        notes=notes,
+        notes=_notes(times, placed, np.max(ages, axis=0), options),
     )
 
 
-def pair_frames(
-    left: Sequence[Frame], right: Sequence[Frame], tolerance_ns: int
-) -> list[tuple[Frame, Frame]]:
-    """Greedily pair each left frame with an unused nearby right frame."""
-    pairs: list[tuple[Frame, Frame]] = []
-    index = 0
-    for left_frame in left:
-        while index < len(right) and right[index].ts_ns < left_frame.ts_ns - tolerance_ns:
-            index += 1
-        if index >= len(right):
-            break
-        best = index
-        if index + 1 < len(right) and abs(right[index + 1].ts_ns - left_frame.ts_ns) <= abs(
-            right[index].ts_ns - left_frame.ts_ns
-        ):
-            best = index + 1
-        if abs(right[best].ts_ns - left_frame.ts_ns) <= tolerance_ns:
-            pairs.append((left_frame, right[best]))
-            index = best + 1
-    return pairs
+def slot_grid(left: np.ndarray, right: np.ndarray, slot_ns: int) -> np.ndarray:
+    """Slot instants from where both eyes have started to where the first one ends."""
+    # Half a slot early centres frames in their slots, so jitter does not cross a boundary.
+    base = min(left[0], right[0]) - slot_ns // 2
+    first = (max(left[0], right[0]) - base) // slot_ns
+    last = (min(left[-1], right[-1]) - base) // slot_ns
+    return base + np.arange(first, last + 1, dtype=np.int64) * slot_ns
+
+
+def place_frames(
+    times: np.ndarray, grid: np.ndarray, slot_ns: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Give each slot the first frame inside it, else repeat the frame before it."""
+    first = np.searchsorted(times, grid)
+    inside = first < len(times)
+    inside[inside] = times[first[inside]] < grid[inside] + slot_ns
+    return np.where(inside, first, first - 1), ~inside
+
+
+def hold_last_index(times: np.ndarray, grid: np.ndarray) -> np.ndarray:
+    """Index of the last sample at or before each instant, or the first sample."""
+    return np.clip(np.searchsorted(times, grid, side="right") - 1, 0, len(times) - 1)
 
 
 def _arm_series(
     samples: Sequence[RobotSample], arm: str
 ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Each kind's receive times and values; receive time shares the cameras' clock."""
     result: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for kind in KINDS:
         rows = [sample for sample in samples if sample.arm == arm and sample.kind == kind]
         if not rows:
             raise ValueError(f"no {kind} samples for {arm}")
-        rows.sort(key=_sample_time)
-        times = np.array([_sample_time(sample) for sample in rows], dtype=np.int64)
-        values = np.array([sample.values for sample in rows], dtype=np.float64)
-        unique, first = np.unique(times, return_index=True)
-        result[kind] = (unique, values[first])
+        rows.sort(key=lambda sample: sample.t_ns)
+        times = np.array([sample.t_ns for sample in rows], dtype=np.int64)
+        result[kind] = (times, np.array([sample.values for sample in rows], dtype=np.float64))
     if result["cp"][1].shape[1] != len(POSE_NAMES):
         raise ValueError(f"{arm}: measured_cp must have 7 values, not {result['cp'][1].shape[1]}")
     if result["jaw"][1].shape[1] != 1:
@@ -151,50 +133,35 @@ def _arm_series(
     return result
 
 
-def _sample_time(sample: RobotSample) -> int:
-    return sample.stamp_ns if sample.stamp_ns > 0 else sample.t_ns
-
-
-def _pick(series: tuple[np.ndarray, np.ndarray], target: int, tolerance: int):
-    index = _nearest(series[0], target, tolerance)
-    return None if index is None else (int(series[0][index]), series[1][index])
-
-
-def _nearest(times: np.ndarray, target: int, tolerance: int) -> int | None:
-    index = int(np.searchsorted(times, target))
-    best: int | None = None
-    best_delta = tolerance + 1
-    for candidate in (index - 1, index):
-        if 0 <= candidate < len(times):
-            delta = abs(int(times[candidate]) - target)
-            if delta < best_delta:
-                best = candidate
-                best_delta = delta
-    return best if best_delta <= tolerance else None
-
-
 def _notes(
-    left_count: int,
-    pairs: Sequence[tuple[Frame, Frame]],
-    missing_robot: int,
-    capture_ns: Sequence[int],
-    skew_ns: Sequence[int],
-    fps: int,
+    times: dict[str, np.ndarray],
+    placed: dict[str, tuple[np.ndarray, np.ndarray]],
+    robot_age_ns: np.ndarray,
+    options: AlignOptions,
 ) -> list[str]:
-    notes = [
-        (
-            f"left frames: {left_count}, stereo pairs: {len(pairs)}, "
-            f"aligned frames: {len(capture_ns)}, dropped for robot: {missing_robot}"
+    """Report what the grid had to repeat, skip, or hold; nothing here changes the rows."""
+    rows = len(robot_age_ns)
+    notes = [f"grid: {rows} frames at {options.fps} fps ({rows / options.fps:.2f} s)"]
+    for side in SIDES:
+        positions, repeats = placed[side]
+        unused = len(times[side]) - len(np.unique(positions))
+        gap = np.max(np.diff(times[side]), initial=0) / 1e6
+        notes.append(
+            f"{side}: {len(times[side])} frames captured, {int(repeats.sum())} slots repeated "
+            f"({100 * repeats.mean():.1f}%), {unused} frames unused, longest gap {gap:.0f} ms"
         )
-    ]
-    if len(capture_ns) >= 2:
-        span = (capture_ns[-1] - capture_ns[0]) / 1e9
-        expected = (len(capture_ns) - 1) / fps
-        if expected > 0 and abs(span - expected) / expected > 0.10:
-            notes.append(
-                f"capture span {span:.3f}s differs from nominal {expected:.3f}s; "
-                "hardware frame drops are possible"
-            )
-    if skew_ns:
-        notes.append(f"median jp/jaw/cp header skew: {np.median(skew_ns) / 1e6:.1f} ms")
+    real = ~(placed["left"][1] | placed["right"][1])
+    if real.any():
+        left, right = (times[side][placed[side][0][real]] for side in SIDES)
+        skew = np.abs(left - right) / 1e6
+        notes.append(_spread("stereo skew", skew, options.stereo_tolerance_ms))
+    notes.append(_spread("robot sample age", robot_age_ns / 1e6, options.robot_tolerance_ms))
     return notes
+
+
+def _spread(label: str, values_ms: np.ndarray, tolerance_ms: float) -> str:
+    over = int(np.count_nonzero(values_ms > tolerance_ms))
+    return (
+        f"{label}: median {np.median(values_ms):.1f} ms, worst {values_ms.max():.1f} ms, "
+        f"{over} frames over {tolerance_ms:g} ms"
+    )

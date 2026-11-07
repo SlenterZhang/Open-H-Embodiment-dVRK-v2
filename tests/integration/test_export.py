@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
@@ -57,7 +58,7 @@ def _config() -> dict:
     }
 
 
-def _make_session(root: Path, task: str, phase: float) -> Path:
+def _make_session(root: Path, task: str, phase: float, stall_slots: int = 0) -> Path:
     meta = {
         "task": task,
         "fps": FPS,
@@ -68,6 +69,11 @@ def _make_session(root: Path, task: str, phase: float) -> Path:
     session = RawSession.create(root, meta)
     base = 1_000_000_000
     stamps = [base + index * (1_000_000_000 // FPS) for index in range(FRAMES)]
+    # Frames after index 2 arrive late: the cameras stalled for stall_slots slots.
+    stamps = [
+        stamp + (stall_slots * (1_000_000_000 // FPS) if index > 2 else 0)
+        for index, stamp in enumerate(stamps)
+    ]
     for side, offset in (("left", 0), ("right", 5_000_000)):
         video, timestamps = video_files(root, side)
         process = start_encoder(video, width=64, height=48, fps=FPS, crf=18, preset="ultrafast")
@@ -141,3 +147,34 @@ def test_export_and_verify(tmp_path: Path) -> None:
 
     with pytest.raises(ExportError, match="already exists"):
         export_dataset(episodes, config, tmp_path / "dataset")
+
+
+def test_stall_is_exported_as_repeated_pictures(tmp_path: Path) -> None:
+    config = parse_config(_config())
+    options = AlignOptions(fps=FPS, stereo_tolerance_ms=15.0, robot_tolerance_ms=25.0)
+    path = _make_session(tmp_path / "raw", "needle transfer", 0.0, stall_slots=2)
+    episode = align_session(load_session(path), config.arms, options)
+    export_dataset([episode], config, tmp_path / "dataset")
+
+    assert verify_dataset(tmp_path / "dataset")["frames"] == FRAMES + 2
+    table = pq.read_table(tmp_path / "dataset" / "data" / "chunk-000" / "episode_000000.parquet")
+    assert table["timestamp"].to_numpy()[-1] == pytest.approx((FRAMES + 1) / FPS)
+    video = (
+        tmp_path
+        / "dataset"
+        / "videos"
+        / "chunk-000"
+        / "observation.images.left"
+        / "episode_000000.mp4"
+    )
+    capture = cv2.VideoCapture(str(video))
+    blue = []
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        blue.append(float(frame[:, :, 0].mean()))
+    capture.release()
+    # The source's blue channel is 30 * frame index; frame 2 fills the stall's two slots.
+    expected = [30 * index for index in (0, 1, 2, 2, 2, 3, 4, 5)]
+    assert np.allclose(blue, expected, atol=6.0)

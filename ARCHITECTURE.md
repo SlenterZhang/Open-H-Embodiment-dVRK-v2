@@ -13,7 +13,8 @@ v2.1 episode.
 - Record two V4L2 camera streams from `/dev/video0` and `/dev/video2`.
 - Preserve enough timing information to align the streams offline.
 - Export a self-contained LeRobot Dataset v2.1 with parquet, MP4, and metadata.
-- Fail visibly: no silent topic substitution, resizing, or invented frames.
+- Fail visibly: no silent topic substitution or resizing. A grid slot that no
+  frame reached repeats the previous picture, and `convert` reports the count.
 - Keep the ROS/OpenCV acquisition environment separate from the ML/training
   environment.
 
@@ -81,7 +82,7 @@ src/dvrk_lerobot/
 │   ├── recorder.py            warm-up and capture loop
 │   └── session.py             append-only raw session + loader
 ├── align/
-│   └── sync.py                stereo pairing and robot nearest-neighbour
+│   └── sync.py                slot grid, frame placement, robot hold-last
 ├── dataset/
 │   ├── schema.py              LeRobot feature names and path templates
 │   ├── stats.py               numeric/video stats and pooled aggregation
@@ -184,36 +185,38 @@ There are three timestamp domains:
 
 | Domain | Source | Used for |
 |---|---|---|
-| Wall clock | `time.time_ns()` | camera capture time, receive time, session start/end |
-| ROS header stamp | `msg.header.stamp` | robot sample alignment time |
+| Wall clock | `time.time_ns()` | camera capture time, robot receive time, alignment |
+| ROS header stamp | `msg.header.stamp` | stored in the raw log, not used for alignment |
 | Output timeline | `frame_index / fps` | LeRobot `timestamp` column |
 
 The recorder writes both `t_ns` (receive) and `stamp_ns` (header) for every
-robot sample. The aligner prefers `stamp_ns` and falls back to `t_ns` when the
-header stamp is zero.
+robot sample. The aligner uses `t_ns`, because that is the clock the camera
+frames are stamped with. `stamp_ns` comes from another source: an offset in it
+would move the state against the picture without any error.
 
 Assumptions:
 
 - `use_sim_time` is false.
-- Robot and camera clocks are the same system clock, or at least differ by a
-  constant offset that is checked before collection.
-- A header-stamp offset larger than two seconds is a configuration error; the
-  recorder warns once per topic and `doctor` prints the measured offset.
+- A camera frame's time is when the capture thread finished reading it, so the
+  picture is older than its time by the capture latency. Alignment does not
+  correct for that latency.
+- A wall-clock step during an episode shifts the frames and the robot together,
+  but a backward step makes the session fail to load.
 
 ### Why not interpolate
 
-The aligner uses nearest-neighbour selection, not interpolation. This avoids
-inventing joint states or poses that the robot never reported. The cost is that
-the state is at most `robot_tolerance_ms` old relative to the stereo pair. The
-exporter records the median joint/pose header skew in the alignment notes.
+The aligner holds the last sample, not an interpolated one. This avoids
+inventing joint states or poses that the robot never reported, and it never uses
+a sample from after the slot instant. The alignment notes report how old the
+held samples were.
 
-### Why the output timeline is synthetic
+### Why the output timeline is a grid
 
-LeRobot requires a fixed-fps timeline. If raw capture is slightly irregular,
-writing raw timestamps would fail LeRobot's timestamp check and make frame
-indexing ambiguous. The exporter instead writes `k / fps` and keeps the true
-capture times in the raw `*_timestamps.txt` files. The alignment notes warn when the raw
-capture span differs from the nominal span by more than 10%.
+LeRobot requires a fixed-fps timeline, with `timestamp = k / fps`. That is only
+true of the data if row `k` really is `k` slots after row 0, so the aligner
+builds the rows from a grid instead of numbering whichever frames survived. A
+missed frame costs a repeated picture rather than shortening the episode. The
+true capture times stay in the raw `*_timestamps.txt` files.
 
 ## 6. Raw session format
 
@@ -299,36 +302,43 @@ skipped.
 
 `measured_js` and `measured_cp` are independent topics with independent rates
 and header stamps. Storing them as separate events preserves each message's
-original timestamp. The aligner builds one time series per `(arm, kind)` and
-independently selects the nearest sample for each output frame.
+original timestamps. The aligner builds one time series per `(arm, kind)` and
+independently holds the latest sample for each output frame.
 
 ## 7. Alignment algorithm
 
 Given a raw session:
 
-1. Build sorted `(stamp, values)` series for every `(arm, jp)`, `(arm, jaw)`, and `(arm, cp)`.
-   Duplicate stamps collapse to the first sample.
-2. Pair frames:
+1. Build one grid for both eyes, with `slot_ns = round(1e9 / fps)`:
 
 ```text
-j = 0
-for each left frame L:
-    while j < len(right) and right[j].ts < L.ts - stereo_tol:
-        j += 1
-    choose j or j+1, whichever is closer to L.ts
-    if |chosen.ts - L.ts| <= stereo_tol:
-        emit pair (L, chosen)
-        j = chosen + 1
+base = min(first left, first right) - slot_ns // 2
+grid = every base + i * slot_ns, from the slot holding the later eye's first
+       frame to the slot holding the earlier eye's last frame
 ```
 
-Left is the master. Each right frame is used at most once.
+   The half-slot start centres frames in their slots, so timing jitter does not
+   push them across a boundary. Trimming to where both eyes have frames means
+   slot 0 always has a picture in each eye.
+2. Give each eye one frame per slot `[g, g + slot_ns)`. The first frame inside
+   the slot wins and any later one in that slot goes unused. An empty slot
+   repeats the previous frame. Row `k` of both eyes is therefore the same slot,
+   and their skew is bounded by one slot.
+3. Build sorted `(t_ns, values)` series for every `(arm, jp)`, `(arm, jaw)`, and
+   `(arm, cp)`. For each slot instant `g`, hold the last sample at or before `g`.
+   Before the first sample, use the first sample.
+4. Concatenate the selected values in configuration order to form the state.
+5. Set `timestamp[k] = k / fps`.
+6. Set `action[t] = state[t + 1]`, with the final action repeated.
 
-3. For each pair, compute `t = (L.ts + R.ts) // 2`.
-4. For each arm, find the nearest `jp`, `jaw`, and `cp` timestamps to `t` within
-   `robot_tolerance_ms`. If any is missing, drop the pair and count it.
-5. Concatenate the selected values in configuration order to form the state.
-6. Set `timestamp[k] = k / fps`.
-7. Set `action[t] = state[t + 1]`, with the final action repeated.
+Rows are never removed. `stereo_tolerance_ms` and `robot_tolerance_ms` only set
+what the alignment notes count, along with repeated slots, unused frames, and
+the longest capture gap per eye.
+
+Repeated slots are expected for a card that runs below the grid rate: at 27 fps
+on a 30 fps grid, about one slot in ten repeats. A repeated picture is a stale
+image next to a fresh robot state, so a high count means the episode needs
+checking.
 
 The result is an `Episode`:
 
@@ -340,8 +350,8 @@ Episode(
     action=np.ndarray,      # (N, D), float32
     timestamps=np.ndarray,  # (N,), float32, k/fps
     videos=dict[str, Path], # raw left/right MKV
-    left=list[int],         # N frame indices into videos["left"]
-    right=list[int],        # N frame indices into videos["right"]
+    left=list[int],         # N non-decreasing frame indices into videos["left"]
+    right=list[int],        # N non-decreasing frame indices into videos["right"]
     state_names=list[str],  # D names
     notes=list[str],
 )
@@ -407,8 +417,9 @@ Each episode is encoded independently:
        videos/.../episode_XXXXXX.mp4
 ```
 
-The raw video is decoded sequentially and only the aligned frame indices are
-piped to the encoder, so frames dropped by alignment are skipped. After encoding, `ffprobe` supplies the actual
+The raw video is decoded sequentially and each slot's frame is piped to the
+encoder, so unused frames are skipped and repeated slots are written again.
+After encoding, `ffprobe` supplies the actual
 dimensions, codec, pixel format, and frame rate. The feature schema uses those
 probed values.
 
@@ -455,13 +466,14 @@ user directory.
 - One session has exactly two camera directories.
 - Camera resolution must match the requested configuration; no resize.
 - Both cameras must negotiate the same resolution and rate.
-- A zero header stamp falls back to receive time, with a warning.
+- A zero header stamp logs a warning; alignment uses receive time regardless.
 - A camera thread failure aborts the session.
 
 ### Alignment invariants
 
-- At least two stereo pairs are required.
-- Every pair must have `jp`, `jaw`, and `cp` for every configured arm.
+- At least two grid slots are required.
+- Every configured arm must have `jp`, `jaw`, and `cp` samples.
+- Row `k` of the state, of each eye, and of `timestamp` is grid slot `k`.
 - `jaw/measured_js` must have exactly one value.
 - `measured_cp` must have exactly seven values.
 - State values must be finite.
@@ -503,8 +515,8 @@ Measured on the lab machine (UGREEN capture cards, 1920x1080, libx264
 
 The recorder does not buffer frames in memory. Each frame is piped to ffmpeg
 before the next `read()`, which applies natural back-pressure. If the encoder
-cannot keep up, the V4L2 driver drops frames and the exporter's span check
-reports the mismatch.
+cannot keep up, the V4L2 driver drops frames and `convert` reports the slots it
+had to repeat.
 
 ### Export
 
@@ -611,8 +623,8 @@ are handled as follows:
 
 ## 14. Verification strategy
 
-1. **Unit tests** cover config validation, raw session invariants, pairing,
-   nearest-neighbour selection, state construction, and pooled statistics.
+1. **Unit tests** cover config validation, raw session invariants, the slot grid,
+   frame placement, robot hold-last, state construction, and pooled statistics.
 2. **Integration test** builds two synthetic sessions, encodes real MP4s with
    ffmpeg, exports, and runs the structural verifier.
 3. **`verify` command** checks a real dataset's metadata, parquet, and video

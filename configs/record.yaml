@@ -43,7 +43,9 @@ cameras:
     crf: 18
 
 alignment:
-  # Maximum allowed |t_left - t_right| when forming a stereo pair.
-  stereo_tolerance_ms: 15.0
-  # Maximum allowed age of the nearest robot sample for a stereo pair.
+  # These only set what `convert` reports; no frame is removed for exceeding them.
+  # Report grid frames whose two eyes are further apart than this. The skew of
+  # free-running cards is bounded by one slot (33 ms at 30 fps); 25 is 3/4 of a slot.
+  stereo_tolerance_ms: 25.0
+  # Report grid frames whose held robot sample is older than this.
   robot_tolerance_ms: 25.0

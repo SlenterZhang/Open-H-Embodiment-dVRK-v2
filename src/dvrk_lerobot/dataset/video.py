@@ -47,15 +47,16 @@ def finish_encoder(process: subprocess.Popen, action: str) -> None:
 
 
 def read_frames(source: Path, indices: Sequence[int]) -> Iterator[np.ndarray]:
-    """Decode *source* sequentially and yield the BGR frames at increasing *indices*."""
+    """Decode *source* sequentially and yield the BGR frames at non-decreasing *indices*."""
     capture = cv2.VideoCapture(str(source))
     if not capture.isOpened():
         raise VideoError(f"cannot open {source}")
     position = 0
+    frame = None
     try:
         for index in indices:
-            if index < position:
-                raise VideoError(f"{source}: frame indices must increase")
+            if index < position - 1:
+                raise VideoError(f"{source}: frame indices must not decrease")
             while position <= index:
                 ok, frame = capture.read()
                 if not ok:

@@ -222,24 +222,26 @@ Examples:
 Example output:
 
 ```text
-[align] 20261027-192407/episode_1: left frames: 464, stereo pairs: 463, aligned frames: 463, dropped for robot: 0
-[align] 20261027-192407/episode_1: median jp/jaw/cp header skew: 0.6 ms
-[align] 20261027-192407/episode_2: left frames: 372, stereo pairs: 372, aligned frames: 372, dropped for robot: 0
-[align] 20261027-192407/episode_2: median jp/jaw/cp header skew: 0.6 ms
+[align] 20261027-192407/episode_1: grid: 96 frames at 30 fps (3.20 s)
+[align] 20261027-192407/episode_1: left: 90 frames captured, 6 slots repeated (6.2%), 0 frames unused, longest gap 233 ms
+[align] 20261027-192407/episode_1: right: 90 frames captured, 6 slots repeated (6.2%), 0 frames unused, longest gap 233 ms
+[align] 20261027-192407/episode_1: stereo skew: median 11.8 ms, worst 14.7 ms, 0 frames over 25 ms
+[align] 20261027-192407/episode_1: robot sample age: median 3.7 ms, worst 7.0 ms, 0 frames over 25 ms
 dataset: /home/zhang/zst/Open-H-Embodiment-dVRK-v2/data/lerobot/needle_pick
-episodes: 2, frames: 835
+episodes: 1, frames: 96
 ```
 
 How to read it:
 
 | Field | Meaning | Healthy value |
 |---|---|---|
-| `left frames` | Frames recorded by the left camera | about 30 per second |
-| `stereo pairs` | Left frames that found a right frame within `stereo_tolerance_ms` | close to `left frames` |
-| `aligned frames` | Pairs that also found robot data within `robot_tolerance_ms`. **These become the dataset frames** | close to `stereo pairs` |
-| `dropped for robot` | Pairs without robot data close enough in time | 0 or a few |
-| `header skew` | Spread between the joint, jaw and pose samples used for one frame | a few ms |
-| `capture span ... differs` (warning) | The cameras dropped frames during recording | absent |
+| `grid` | Dataset frames for this episode. The duration matches the time both cameras were recording | the length of the episode |
+| `frames captured` | Frames recorded by this camera | about 30 per second |
+| `slots repeated` | Grid frames with no new picture from this camera, which show the previous one again | a few percent |
+| `frames unused` | Frames that arrived in a slot that already had one, or outside the grid | a few |
+| `longest gap` | Longest time between two frames from this camera | about 33 ms, a few frames at most |
+| `stereo skew` | Time between the left and right frames of one dataset frame | under 33 ms at 30 fps |
+| `robot sample age` | Time between a dataset frame and the robot samples held for it | a few ms |
 
 Episodes in a run folder whose status is not `ok` are skipped with a
 `[convert] skipping ...` line. If conversion fails, the half-written output is
@@ -248,19 +250,28 @@ kept as `<output>.partial` for inspection; delete it before retrying.
 ### 3.6 How the time alignment works
 
 The robot (about 100 Hz per topic) and the two cameras (about 30 fps each) run
-on independent clocks. `convert` builds one row per video frame:
+independently. `convert` places them all on one fixed-rate grid, so frame *k* is
+`k / fps` seconds into the episode:
 
-1. **Stereo pairing.** Each left frame is paired with the nearest unused right
-   frame. Pairs further apart than `stereo_tolerance_ms` are discarded.
-2. **Frame time.** The time of a pair is the midpoint of its two capture times.
-3. **Robot state.** For each arm, the nearest `jp`, `jaw` and `cp` samples (by
-   ROS header time) are attached. If any is further away than
-   `robot_tolerance_ms`, the frame is dropped.
-4. **Output timeline.** Kept frames are numbered `0..N-1` with
-   `timestamp = frame_index / fps` (what LeRobot expects). The true capture
-   times stay in the raw folder.
-5. **Video.** Only the kept frames are re-encoded into the dataset MP4s, so
-   video frame *k* always matches parquet row *k*.
+1. **Grid.** One slot every `1 / fps` seconds, shared by both eyes, covering the
+   time when both cameras were recording.
+2. **Video.** Each eye gives a slot the first frame that arrived inside it. A
+   slot with no new frame repeats the previous picture, so a dropped frame does
+   not shorten the episode.
+3. **Robot state.** For each arm, the latest `jp`, `jaw` and `cp` samples received
+   at or before the slot's time are attached. Receive time is used because the
+   camera frames are stamped on the same PC clock. ROS header stamps are kept in
+   the raw data but not used here.
+4. **Output.** Video frame *k* matches parquet row *k*, and
+   `timestamp = frame_index / fps` (what LeRobot expects). The true capture times
+   stay in the raw folder.
+
+Frames are never removed for being outside a tolerance. `stereo_tolerance_ms` and
+`robot_tolerance_ms` only set what the `convert` output counts.
+
+Raw recordings made before this grid was added can be converted again without
+recording them again. Datasets already converted keep the old timing: they
+dropped frames and then numbered the rest as if nothing was missing.
 
 ### 3.7 Verify
 
@@ -402,8 +413,8 @@ ffmpeg -hide_banner -f v4l2 -list_formats all -i /dev/video0
 
 | Key | Default | Meaning |
 |---|---|---|
-| `stereo_tolerance_ms` | 15 | Max time difference between a left and right frame |
-| `robot_tolerance_ms` | 25 | Max time difference between a frame and the robot sample attached to it |
+| `stereo_tolerance_ms` | 25 | `convert` counts frames whose left and right pictures are further apart than this |
+| `robot_tolerance_ms` | 25 | `convert` counts frames whose held robot sample is older than this |
 
 Changing `dataset` or `alignment` only needs a new `convert`; the raw data does
 not have to be recorded again.
@@ -435,9 +446,8 @@ not have to be recorded again.
 | `negotiated 1280x720, expected 1920x1080` | Mode not supported by the card | Pick a listed mode (section 6) |
 | Preview window does not appear / Qt `xcb` error | No display (e.g. SSH session) | Run from the desktop session, or `ssh -X` |
 | Keys do nothing | Neither the preview window nor the terminal has focus | Click the preview window or the terminal |
-| Many `dropped for robot` frames | Robot topics stalled during recording | Check `ros2 topic hz /PSM1/measured_js`; raise `robot_tolerance_ms` only if the gaps are small |
-| `stereo pairs` much lower than `left frames` | The two capture cards started half a frame apart | Re-convert with `stereo_tolerance_ms: 20` |
-| `capture span ... differs from nominal` | Cameras dropped frames (CPU or USB overload) | Close other heavy programs; check the USB connections |
+| Many `robot sample age` frames over the tolerance | Robot topics stalled during recording | Check `ros2 topic hz /PSM1/measured_js`; discard the episode if the state was held through motion |
+| High `slots repeated` or a long `longest gap` | Cameras dropped frames or run below `fps` (CPU or USB overload) | Close other heavy programs; check the USB connections; discard the episode if the picture was frozen through motion |
 | `session status is 'aborted'` | The episode was ended with `q` / Ctrl+C | Add `--allow-incomplete` if the episode is usable |
 | `output already exists` | `--output` folder exists | Choose a new name, or delete the old dataset |
 | `convert failed ... partial output kept` | Error during conversion | Read the message, delete `<output>.partial`, run again |
