@@ -20,6 +20,10 @@ def verify_dataset(path: str | Path) -> dict[str, Any]:
     """Validate metadata, parquet tables, and video files; return a summary."""
     root = Path(path)
     info = _read_json(root / "meta" / "info.json")
+    if info.get("codebase_version") == "v3.0":
+        from dvrk_lerobot.tools.verify_v30 import verify_dataset_v30
+
+        return verify_dataset_v30(root)
     if info.get("codebase_version") != schema.CODEBASE_VERSION:
         raise VerifyError(f"unexpected codebase_version: {info.get('codebase_version')}")
     episodes = _read_jsonl(root / "meta" / "episodes.jsonl")

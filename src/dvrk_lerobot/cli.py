@@ -10,6 +10,7 @@ from dvrk_lerobot.acquire.session import load_session
 from dvrk_lerobot.align.sync import AlignOptions, align_session
 from dvrk_lerobot.config import ConfigError, load_config
 from dvrk_lerobot.dataset.writer import export_dataset
+from dvrk_lerobot.dataset.writer_v30 import export_dataset_v30
 from dvrk_lerobot.tools.doctor import run_doctor
 from dvrk_lerobot.tools.verify import verify_dataset
 
@@ -70,7 +71,8 @@ def _convert(args: argparse.Namespace) -> int:
         for note in episode.notes:
             print(f"[align] {path.parent.name}/{path.name}: {note}")
         episodes.append(episode)
-    result = export_dataset(episodes, config, Path(args.output))
+    export = export_dataset_v30 if args.format == "v3.0" else export_dataset
+    result = export(episodes, config, Path(args.output))
     print(f"dataset: {result.root}")
     print(f"episodes: {result.episodes}, frames: {result.frames}")
     return 0
@@ -126,6 +128,12 @@ def _parser() -> argparse.ArgumentParser:
         "--sessions", nargs="+", required=True, help="run directories and/or episode directories"
     )
     convert.add_argument("--output", required=True, help="new dataset directory")
+    convert.add_argument(
+        "--format",
+        choices=("v2.1", "v3.0"),
+        default="v2.1",
+        help="LeRobot dataset format: v2.1 (lerobot<=0.3.x) or v3.0 (lerobot 0.6.0)",
+    )
     convert.add_argument(
         "--allow-incomplete",
         action="store_true",

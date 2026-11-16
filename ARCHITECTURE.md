@@ -89,10 +89,14 @@ src/dvrk_lerobot/
 │   ├── video.py               ffmpeg encode + ffprobe
 │   ├── parquet.py             per-episode frame table
 │   ├── metadata.py            meta/*.json and meta/*.jsonl
-│   └── writer.py              export orchestration and atomic rename
+│   ├── writer.py              export orchestration and atomic rename
+│   ├── writer_v30.py          --format v3.0: v2.1 staging export, then repack
+│   ├── v30.py                 v2.1 -> v3.0 repack (lerobot 0.6.0 layout)
+│   └── v30_video.py           ffmpeg concat + stream duration for v3.0 videos
 └── tools/
     ├── doctor.py              pre-flight diagnostics
-    └── verify.py              read-only dataset checks
+    ├── verify.py              read-only dataset checks (dispatches v3.0)
+    └── verify_v30.py          read-only v3.0 dataset checks
 ```
 
 Dependency direction:
@@ -102,7 +106,8 @@ cli -> acquire, align, dataset, tools
 acquire.recorder -> acquire.node, acquire.camera, acquire.session
 align -> acquire.session, dataset.schema, config
 dataset.writer -> align.sync, dataset.*, config
-tools.verify -> dataset.schema, dataset.video
+dataset.writer_v30 -> dataset.writer, dataset.v30
+tools.verify -> dataset.schema, dataset.video, tools.verify_v30
 tools.doctor -> acquire.camera, config
 ```
 
@@ -457,6 +462,28 @@ The exporter:
 
 A failed export leaves the partial tree in place. It never deletes or reuses a
 user directory.
+
+### Optional v3.0 output (`convert --format v3.0`)
+
+The v2.1 path above is unchanged and remains the default. With `--format v3.0`
+the exporter writes the v2.1 tree to `<output>.v2.1`, repacks it into
+`<output>.partial` following lerobot 0.6.0's `convert_dataset_v21_to_v30`, renames
+it to `<output>`, and deletes the staging copy. Alignment, features, encoded
+video bytes and statistics are identical; only the storage differs:
+
+| v2.1 | v3.0 |
+|---|---|
+| `data/chunk-XXX/episode_XXXXXX.parquet` | `data/chunk-XXX/file-XXX.parquet`, episodes appended until 100 MB |
+| `videos/chunk-XXX/<key>/episode_XXXXXX.mp4` | `videos/<key>/chunk-XXX/file-XXX.mp4`, stream-copied concat until 200 MB |
+| `meta/episodes.jsonl` + `episodes_stats.jsonl` | `meta/episodes/chunk-000/file-000.parquet` (`stats/<feature>/<stat>` columns) |
+| `meta/tasks.jsonl` | `meta/tasks.parquet`, pandas index `task` → `task_index` |
+| `info.json`: `total_chunks`, `total_videos` | `info.json`: `data_files_size_in_mb`, `video_files_size_in_mb`, `fps` on non-video features |
+
+Each episode row records its rows in the data file (`dataset_from_index`,
+`dataset_to_index`) and its span in the concatenated MP4
+(`videos/<key>/from_timestamp`, `to_timestamp`, summed from ffprobe stream
+durations as lerobot does). A frame at `timestamp` t is decoded at
+`from_timestamp + t`.
 
 ## 9. Error handling and invariants
 

@@ -204,6 +204,7 @@ again at any time.
 |---|---|
 | `--sessions` | One or more **run folders** and/or **episode folders**. A run folder expands to its `episode_1..N` in numeric order (`episode_10` after `episode_9`) |
 | `--output` | New dataset folder. It must not exist yet; nothing is ever overwritten |
+| `--format` | `v2.1` (default, `lerobot<=0.3.x`) or `v3.0` (LeRobot dataset format v3.0, `lerobot==0.6.0`); see [4.1](#41-v30-layout---format-v30) |
 | `--allow-incomplete` | Also convert episodes whose status is not `ok` |
 | `-c / --config` | Configuration file (tolerances and output video settings) |
 
@@ -324,6 +325,26 @@ data/lerobot/needle_pick/
 | `index` | int64 | global frame number across episodes |
 | `task_index` | int64 | row in `tasks.jsonl` |
 
+### 4.1 v3.0 layout (`--format v3.0`)
+
+Same alignment, features, videos and statistics; only the storage changes. The
+exporter writes the v2.1 tree to `<output>.v2.1`, repacks it the way
+lerobot 0.6.0's `convert_dataset_v21_to_v30` does, and then deletes the staging copy.
+
+```text
+data/lerobot/needle_pick/
+├── meta/
+│   ├── info.json                         ← codebase_version "v3.0", file-based path templates
+│   ├── tasks.parquet                     ← task (index) → task_index
+│   ├── stats.json
+│   └── episodes/chunk-000/file-000.parquet  ← per episode: tasks, length, data/video file + span, stats/*
+├── data/chunk-000/file-000.parquet       ← many episodes per file (rolls over at 100 MB)
+└── videos/observation.images.{left,right}/chunk-000/file-000.mp4  ← episodes concatenated (200 MB)
+```
+
+Each episode row stores `dataset_from_index/dataset_to_index` (rows in the data
+file) and `videos/<key>/from_timestamp/to_timestamp` (its span inside the MP4).
+
 State names, in order (stored in `info.json`):
 
 ```text
@@ -344,7 +365,8 @@ not mix with the ROS acquisition environment:
 
 ```bash
 python -m venv ~/envs/lerobot && source ~/envs/lerobot/bin/activate
-pip install "lerobot==0.3.3"      # uses the v2.1 dataset format
+pip install "lerobot==0.3.3"      # for --format v2.1 (default)
+pip install "lerobot==0.6.0"      # for --format v3.0
 ```
 
 ```python
@@ -357,8 +379,7 @@ print(sample["observation.state"].shape)          # torch.Size([28])
 print(sample["observation.images.left"].shape)    # torch.Size([3, 1080, 1920])
 ```
 
-Newer LeRobot releases default to the v3.0 format. Check that the version you
-train with can read v2.1 datasets.
+lerobot 0.4+ only reads v3.0. Export with `--format v3.0` for those versions.
 
 ---
 
