@@ -22,6 +22,8 @@ class AlignOptions:
     fps: int
     stereo_tolerance_ms: float
     robot_tolerance_ms: float
+    external_tolerance_ms: float = 25.0
+    require_external: bool = False
 
 
 @dataclass
@@ -38,24 +40,36 @@ class Episode:
     right: list[int]
     state_names: list[str]
     notes: list[str]
+    external: list[int] | None = None
+    depth: Path | None = None
+    depth_scale: float | None = None
+    depth_shape: tuple[int, int] | None = None
 
 
 def align_session(session: Session, arms: Sequence[ArmConfig], options: AlignOptions) -> Episode:
-    """Fill every grid slot with both eyes and the held robot state; rows are never removed."""
+    """Fill every grid slot with each camera and the held robot state; rows are never removed."""
     recorded_fps = int(session.meta.get("fps", options.fps))
     if recorded_fps != options.fps:
         raise ValueError(
             f"{session.root}: recorded at {recorded_fps} fps, convert config uses {options.fps}"
         )
+    has_external = "external" in session.frames
+    if has_external != options.require_external:
+        raise ValueError(f"{session.root}: RGB-D presence differs from the conversion config")
     slot_ns = round(1e9 / options.fps)
+    streams = (*SIDES, "external") if has_external else SIDES
     times = {
-        side: np.array([frame.ts_ns for frame in session.frames[side]], dtype=np.int64)
-        for side in SIDES
+        name: np.array([frame.ts_ns for frame in session.frames[name]], dtype=np.int64)
+        for name in streams
     }
-    grid = slot_grid(times["left"], times["right"], slot_ns)
+    grid = slot_grid(times["left"], times["right"], slot_ns, *(times[n] for n in streams[2:]))
     if len(grid) < 2:
         raise ValueError(f"{session.root}: fewer than two grid slots")
-    placed = {side: place_frames(times[side], grid, slot_ns) for side in SIDES}
+    placed = {name: place_frames(times[name], grid, slot_ns) for name in streams}
+    indices = {
+        name: [session.frames[name][position].index for position in placed[name][0]]
+        for name in streams
+    }
 
     names = state_names(arms, session.meta.get("joint_names", {}))
     blocks: list[np.ndarray] = []
@@ -76,6 +90,7 @@ def align_session(session: Session, arms: Sequence[ArmConfig], options: AlignOpt
         raise ValueError(f"{session.root}: non-finite robot state")
     action = np.concatenate((state[1:], state[-1:]), axis=0)
     timestamps = (np.arange(len(state), dtype=np.float64) / options.fps).astype(np.float32)
+    rs_info = session.meta.get("realsense", {})
     return Episode(
         session=session.root,
         task=session.task,
@@ -83,19 +98,26 @@ def align_session(session: Session, arms: Sequence[ArmConfig], options: AlignOpt
         action=action,
         timestamps=timestamps,
         videos=session.videos,
-        left=[session.frames["left"][position].index for position in placed["left"][0]],
-        right=[session.frames["right"][position].index for position in placed["right"][0]],
+        left=indices["left"],
+        right=indices["right"],
         state_names=names,
         notes=_notes(times, placed, np.max(ages, axis=0), options),
+        external=indices.get("external"),
+        depth=session.depth if has_external else None,
+        depth_scale=float(rs_info["depth_scale"]) if has_external else None,
+        depth_shape=(int(rs_info["height"]), int(rs_info["width"])) if has_external else None,
     )
 
 
-def slot_grid(left: np.ndarray, right: np.ndarray, slot_ns: int) -> np.ndarray:
-    """Slot instants from where both eyes have started to where the first one ends."""
+def slot_grid(
+    left: np.ndarray, right: np.ndarray, slot_ns: int, *others: np.ndarray
+) -> np.ndarray:
+    """Slot instants from where every camera has started to where the first one ends."""
+    streams = (left, right, *others)
     # Half a slot early centres frames in their slots, so jitter does not cross a boundary.
-    base = min(left[0], right[0]) - slot_ns // 2
-    first = (max(left[0], right[0]) - base) // slot_ns
-    last = (min(left[-1], right[-1]) - base) // slot_ns
+    base = min(times[0] for times in streams) - slot_ns // 2
+    first = (max(times[0] for times in streams) - base) // slot_ns
+    last = (min(times[-1] for times in streams) - base) // slot_ns
     return base + np.arange(first, last + 1, dtype=np.int64) * slot_ns
 
 
@@ -142,7 +164,7 @@ def _notes(
     """Report what the grid had to repeat, skip, or hold; nothing here changes the rows."""
     rows = len(robot_age_ns)
     notes = [f"grid: {rows} frames at {options.fps} fps ({rows / options.fps:.2f} s)"]
-    for side in SIDES:
+    for side in times:
         positions, repeats = placed[side]
         unused = len(times[side]) - len(np.unique(positions))
         gap = np.max(np.diff(times[side]), initial=0) / 1e6
@@ -155,6 +177,12 @@ def _notes(
         left, right = (times[side][placed[side][0][real]] for side in SIDES)
         skew = np.abs(left - right) / 1e6
         notes.append(_spread("stereo skew", skew, options.stereo_tolerance_ms))
+    if "external" in times:
+        real = ~(placed["left"][1] | placed["external"][1])
+        if real.any():
+            left, external = (times[name][placed[name][0][real]] for name in ("left", "external"))
+            gap = np.abs(left - external) / 1e6
+            notes.append(_spread("RGB-D vs left", gap, options.external_tolerance_ms))
     notes.append(_spread("robot sample age", robot_age_ns / 1e6, options.robot_tolerance_ms))
     return notes
 

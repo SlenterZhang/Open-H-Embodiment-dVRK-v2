@@ -31,10 +31,23 @@ class CameraConfig:
 
 
 @dataclass(frozen=True)
+class RealSenseConfig:
+    """One RGB-D RealSense device, with depth aligned to its color stream."""
+
+    serial: str | None
+    width: int
+    height: int
+    fps: int
+    color_crf: int
+    record_cloud: bool = False
+
+
+@dataclass(frozen=True)
 class AlignmentConfig:
     """Tolerances used when matching camera frames and robot samples."""
 
     stereo_tolerance_ms: float
+    external_tolerance_ms: float
     robot_tolerance_ms: float
 
 
@@ -55,6 +68,7 @@ class AppConfig:
 
     arms: tuple[ArmConfig, ...]
     cameras: dict[str, CameraConfig]
+    realsense: RealSenseConfig | None
     alignment: AlignmentConfig
     dataset: DatasetConfig
 

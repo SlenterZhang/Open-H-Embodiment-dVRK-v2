@@ -35,11 +35,23 @@ def export_dataset(episodes: Sequence[Episode], config: AppConfig, output: Path)
     if not items:
         raise ExportError("no episodes to convert")
     names = items[0].state_names
+    has_depth = items[0].depth is not None
+    if has_depth != (config.realsense is not None):
+        raise ExportError("RGB-D presence differs from the conversion config")
     for episode in items:
         if episode.state_names != names:
             raise ExportError("episodes have different observation.state names")
         if len(episode.left) != len(episode.state) or len(episode.right) != len(episode.state):
             raise ExportError(f"{episode.session}: frame count does not match state count")
+        if (episode.depth is not None) != has_depth:
+            raise ExportError("cannot mix RGB-D and stereo-only episodes")
+        if has_depth and (
+            episode.external is None or len(episode.external) != len(episode.state)
+            or episode.depth_shape != items[0].depth_shape
+            or episode.depth_scale != items[0].depth_scale
+            or episode.depth_shape != (config.realsense.height, config.realsense.width)
+        ):
+            raise ExportError(f"{episode.session}: incompatible RGB-D shape, scale, or frame count")
 
     destination = output.expanduser().absolute()
     partial = destination.with_name(destination.name + ".partial")
@@ -61,26 +73,23 @@ def export_dataset(episodes: Sequence[Episode], config: AppConfig, output: Path)
             if not task:
                 raise ExportError(f"{episode.session}: task is empty")
             task_index = tasks.setdefault(task, len(tasks))
-            left_info = video.encode(
-                episode.videos["left"],
-                episode.left,
-                partial / schema.video_path(episode_index, "left"),
-                fps=config.dataset.fps,
-                crf=config.dataset.video_crf,
-                preset=config.dataset.video_preset,
-            )
-            right_info = video.encode(
-                episode.videos["right"],
-                episode.right,
-                partial / schema.video_path(episode_index, "right"),
-                fps=config.dataset.fps,
-                crf=config.dataset.video_crf,
-                preset=config.dataset.video_preset,
-            )
-            _check_video_pair(left_info, right_info, episode.session)
+            indices = {"left": episode.left, "right": episode.right}
+            if has_depth:
+                indices["external"] = episode.external
+            current_video_info = {
+                side: video.encode(
+                    episode.videos[side], selected,
+                    partial / schema.video_path(episode_index, side),
+                    fps=config.dataset.fps,
+                    crf=config.dataset.video_crf,
+                    preset=config.dataset.video_preset,
+                )
+                for side, selected in indices.items()
+            }
+            _check_video_pair(current_video_info["left"], current_video_info["right"], episode.session)
             if video_info is None:
-                video_info = {"left": left_info, "right": right_info}
-            elif not _same_video(video_info["left"], left_info):
+                video_info = current_video_info
+            elif any(not _same_video(video_info[side], current_video_info[side]) for side in indices):
                 raise ExportError(f"{episode.session}: video format differs from episode 0")
 
             write_episode_table(
@@ -91,6 +100,9 @@ def export_dataset(episodes: Sequence[Episode], config: AppConfig, output: Path)
                 episode_index=episode_index,
                 task_index=task_index,
                 index_offset=total_frames,
+                depth_source=episode.depth,
+                depth_indices=episode.external,
+                depth_shape=episode.depth_shape,
             )
             episode_stats.append(_stats(episode, episode_index, task_index, total_frames))
             episode_rows.append(
@@ -104,7 +116,11 @@ def export_dataset(episodes: Sequence[Episode], config: AppConfig, output: Path)
 
         if video_info is None:
             raise ExportError("no videos were encoded")
-        features = schema.build_features(names, video_info)
+        features = schema.build_features(
+            names, video_info,
+            depth_shape=items[0].depth_shape if has_depth else None,
+            depth_scale=items[0].depth_scale if has_depth else None,
+        )
         info = schema.info_dict(
             fps=config.dataset.fps,
             robot_type=config.dataset.robot_type,
@@ -130,7 +146,7 @@ def export_dataset(episodes: Sequence[Episode], config: AppConfig, output: Path)
 
 def _stats(episode: Episode, episode_index: int, task_index: int, index_offset: int) -> dict:
     frames = len(episode.state)
-    return {
+    result = {
         "observation.state": stats.numeric_stats(episode.state),
         "action": stats.numeric_stats(episode.action),
         "observation.images.left": stats.video_stats(episode.videos["left"], episode.left),
@@ -143,6 +159,12 @@ def _stats(episode: Episode, episode_index: int, task_index: int, index_offset: 
         ),
         "task_index": stats.numeric_stats(np.full(frames, task_index, dtype=np.int64)),
     }
+    if episode.depth is not None:
+        result["observation.images.external"] = stats.video_stats(episode.videos["external"], episode.external)
+        result["observation.depth.external"] = stats.depth_stats(
+            episode.depth, episode.external, episode.depth_shape
+        )
+    return result
 
 
 def _check_video_pair(left: dict, right: dict, session: Path) -> None:

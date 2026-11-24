@@ -7,12 +7,24 @@ import numpy as np
 
 WINDOW = "dVRK recorder  [s] start  [e] end  [q] quit"
 PREVIEW_HEIGHT = 480
+PREVIEW_MAX_WIDTH = 1800
 
 
-def show(left: np.ndarray, right: np.ndarray, status: str, recording: bool) -> str | None:
-    """Draw both eyes side by side and return a key pressed in the window, if any."""
-    width = round(left.shape[1] * PREVIEW_HEIGHT / left.shape[0])
-    canvas = np.hstack([cv2.resize(image, (width, PREVIEW_HEIGHT)) for image in (left, right)])
+def show(
+    left: np.ndarray, right: np.ndarray, status: str, recording: bool,
+    external: np.ndarray | None = None,
+) -> str | None:
+    """Draw all active color views and return a key pressed in the window."""
+    images = (left, right) if external is None else (left, right, external)
+    canvas = np.hstack([
+        cv2.resize(image, (round(image.shape[1] * PREVIEW_HEIGHT / image.shape[0]), PREVIEW_HEIGHT))
+        for image in images
+    ])
+    if canvas.shape[1] > PREVIEW_MAX_WIDTH:
+        canvas = cv2.resize(
+            canvas,
+            (PREVIEW_MAX_WIDTH, round(canvas.shape[0] * PREVIEW_MAX_WIDTH / canvas.shape[1])),
+        )
     color = (0, 0, 255) if recording else (0, 200, 0)
     cv2.putText(canvas, status, (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
     cv2.imshow(WINDOW, canvas)

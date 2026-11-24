@@ -56,6 +56,40 @@ def video_stats(source: Path, indices: Sequence[int]) -> dict[str, np.ndarray]:
     return stats
 
 
+def depth_stats(source: Path, indices: Sequence[int], shape: tuple[int, int]) -> dict[str, np.ndarray]:
+    """Stream global depth statistics over exact raw uint16 values."""
+    from contextlib import closing
+
+    from dvrk_lerobot.dataset.depth import read_frames
+
+    frame_count = 0
+    pixel_count = 0
+    total = 0.0
+    total_sq = 0.0
+    minimum = 65535.0
+    maximum = 0.0
+    height, width = shape
+    stream = read_frames(source, indices, width, height)
+    with closing(stream):
+        for frame in stream:
+            data = frame.astype(np.float64)
+            frame_count += 1
+            pixel_count += data.size
+            total += float(data.sum())
+            total_sq += float(np.square(data).sum())
+            minimum = min(minimum, float(data.min()))
+            maximum = max(maximum, float(data.max()))
+    if frame_count == 0:
+        raise ValueError("no aligned depth frames to summarize")
+    mean = total / pixel_count
+    return {
+        "min": np.array([minimum]), "max": np.array([maximum]),
+        "mean": np.array([mean]),
+        "std": np.array([np.sqrt(max(0.0, total_sq / pixel_count - mean * mean))]),
+        "count": np.array([frame_count], dtype=np.int64),
+    }
+
+
 def aggregate(
     episodes: Sequence[Mapping[str, Mapping[str, np.ndarray]]],
 ) -> dict[str, dict[str, np.ndarray]]:

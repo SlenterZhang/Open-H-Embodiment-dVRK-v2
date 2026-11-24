@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 import time
 from typing import Any
 
 from dvrk_lerobot.acquire.camera import Camera
+from dvrk_lerobot.acquire.realsense import RealSense
 from dvrk_lerobot.config import AppConfig
 
 
@@ -18,10 +20,33 @@ def run_doctor(config: AppConfig, topic_timeout: float = 5.0) -> bool:
         path = shutil.which(name)
         print(f"{'PASS' if path else 'FAIL'} {name}: {path or 'not found'}")
         ok = ok and path is not None
+    if shutil.which("ffmpeg"):
+        try:
+            encoders = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True, text=True, check=False, timeout=15,
+            )
+            available = encoders.stdout if encoders.returncode == 0 else ""
+        except (OSError, subprocess.TimeoutExpired):
+            available = ""
+        for name in ("libx264", "ffv1"):
+            found = name in available
+            print(f"{'PASS' if found else 'FAIL'} encoder {name}")
+            ok = ok and found
 
     print("\n== cameras ==")
     for side in config.camera_sides:
         ok = _camera_check(side, config.cameras[side]) and ok
+    if config.realsense is not None:
+        camera = RealSense(config.realsense)
+        try:
+            info = camera.open()
+            print(f"PASS external RGB-D: {info['width']}x{info['height']} @ {info['fps']} fps, depth scale {info['depth_scale']} m/unit")
+        except Exception as exc:  # noqa: BLE001 - report SDK and device failures
+            print(f"FAIL external RGB-D: {exc}")
+            ok = False
+        finally:
+            camera.stop()
 
     print("\n== ROS 2 topics ==")
     ok = _topic_check(config, topic_timeout) and ok

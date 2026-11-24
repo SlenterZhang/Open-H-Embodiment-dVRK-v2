@@ -13,6 +13,7 @@ dependencies = [
     "opencv-python==4.10.0.84",
     "pyarrow>=14,<19",
     "PyYAML>=6,<7",
+    "pyrealsense2>=2.54,<3",
 ]
 
 [project.optional-dependencies]

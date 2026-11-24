@@ -3,11 +3,24 @@
 Collect teleoperation demonstrations on the dVRK and turn them into a
 [LeRobot v2.1](https://github.com/huggingface/lerobot) dataset.
 
-The tool records two things at the same time:
+The tool records three things at the same time:
 
 - **Robot telemetry** from ROS 2: joint positions, jaw angle and Cartesian pose
   of each PSM (about 100 Hz per topic).
 - **Stereo endoscope video** from two V4L2 capture devices (1920x1080, 30 fps).
+- **External RGB-D observation** from a D435i (color and 16-bit depth aligned to
+  color, 640x480 at 30 fps by default).
+
+The D435i is configured in `configs/record.yaml` under `realsense`. It uses one
+`pyrealsense2` pipeline for both streams. `doctor.sh` checks this device as well
+as the two existing endoscope cameras. Select a serial number in the config if
+multiple RealSense cameras are connected.
+
+Depth is stored as raw unsigned 16-bit values in a lossless FFV1 MKV during
+recording. `meta.json` records `realsense.depth_scale` in metres per raw unit;
+zero is an invalid depth pixel. The depth frame is aligned to the D435i color
+image using the device's internal calibration, but calibration parameters are
+not written to the dataset.
 
 It then aligns both streams in time and writes them in the LeRobot format.
 
@@ -15,6 +28,7 @@ It then aligns both streams in time and writes them in the LeRobot format.
                 ┌──────────────────────────┐        ┌────────────────────────────┐
  dVRK (ROS 2) ─►│ record                   │        │ convert                    │
  endoscope    ─►│ s / e / q, live preview  │──raw──►│ align in time, write       │──► LeRobot v2.1
+ D435i RGB-D  ─►│                          │        │                            │
                 │ data/raw/<run>/episode_N │        │ data/lerobot/<dataset>     │
                 └──────────────────────────┘        └────────────────────────────┘
                  needs the robot                      offline, repeatable
@@ -22,7 +36,7 @@ It then aligns both streams in time and writes them in the LeRobot format.
 
 | Step | Command | What it does |
 |---|---|---|
-| Check | `./scripts/doctor.sh` | Verifies ffmpeg, both cameras and all robot topics |
+| Check | `./scripts/doctor.sh` | Verifies ffmpeg, both endoscope cameras, the D435i and robot topics |
 | Record | `./scripts/record.sh --task "..."` | Records episodes with a preview window; `s` start, `e` end, `q` quit |
 | Convert | `./scripts/convert.sh --sessions ... --output ...` | Aligns robot data and video in time, writes the LeRobot dataset |
 | Verify | `uv run --no-sync dvrk-lerobot verify --dataset ...` | Checks the dataset structure |
@@ -42,7 +56,7 @@ Design details (threading, timing model, file formats) are in
 | Python | 3.10 (the system Python used by ROS Humble) |
 | uv | 0.9 or newer |
 | ffmpeg | System package with `libx264` (`sudo apt install ffmpeg`) |
-| Cameras | Two V4L2 devices: left eye `/dev/video0`, right eye `/dev/video2` |
+| Cameras | Two V4L2 endoscope devices plus one D435i RGB-D camera |
 
 ## 2. One-time setup
 
@@ -53,7 +67,7 @@ sudo apt install ffmpeg
 
 `setup_env.sh` creates `.venv` **with access to the system ROS packages**
 (`--system-site-packages`), so `rclpy` and the ROS message types can be imported,
-and installs `numpy`, `opencv-python` (with GUI), `pyarrow` and `PyYAML` from
+and installs `numpy`, `opencv-python` (with GUI), `pyarrow`, `PyYAML` and `pyrealsense2` from
 the lock file. Do not create the environment with a plain `uv venv`;
 `import rclpy` would fail.
 
@@ -87,8 +101,9 @@ PASS ffmpeg: /usr/bin/ffmpeg
 PASS ffprobe: /usr/bin/ffprobe
 
 == cameras ==
-PASS left: 1920x1080 @ 30.0 fps fourcc='MJPG' (/dev/video0)
-PASS right: 1920x1080 @ 30.0 fps fourcc='MJPG' (/dev/video2)
+PASS left: 1920x1080 @ 30.0 fps fourcc='MJPG' (/dev/video6)
+PASS right: 1920x1080 @ 30.0 fps fourcc='MJPG' (/dev/video8)
+PASS external RGB-D: 640x480 @ 30 fps, depth scale 0.001 m/unit
 
 == ROS 2 topics ==
 listening for 5.0s ...
@@ -100,6 +115,7 @@ RESULT: PASS
 ```
 
 Fix any `FAIL` before recording (see [Troubleshooting](#8-troubleshooting)).
+Also inspect the preview: a capture card can pass while displaying "No Signal".
 The "receive time minus header stamp" should be a few milliseconds; a value of
 seconds means the robot and the PC clocks disagree.
 
@@ -109,12 +125,49 @@ seconds means the robot and the PC clocks disagree.
 ./scripts/record.sh --task "needle pick"
 ```
 
+To record without the RealSense today, leave its settings in the YAML and pass
+`--no-realsense`. Omit the flag on a future run to record RGB-D again:
+
+```bash
+./scripts/record.sh --task "needle pick" --no-realsense
+./scripts/record.sh --task "needle pick"
+```
+
+Use `--no-realsense` with `./scripts/doctor.sh` and `./scripts/convert.sh` as
+well when checking or converting stereo-only sessions. Keep RGB-D and
+stereo-only episodes in separate converted datasets.
+
+Optional live colored point clouds (off by default):
+
+```bash
+./scripts/record.sh --task "needle pick" --record-cloud
+./scripts/record.sh --task "needle pick" --no-record-cloud
+```
+
+These flags override `realsense.record_cloud` in the YAML. Cloud recording requires
+RealSense and cannot be enabled with `--no-realsense`. Each episode gets
+`cloud/frame_000000.ply`, etc., in binary PLY format, plus `cloud/timestamps.csv`
+and `cloud/metadata.json` with calibration and the completed frame count.
+Cloud indices and timestamps match the external RGB-D frames. Coordinates are
+meters in the color camera frame (x right, y down, z forward); invalid zero-depth
+pixels are omitted. Colors come from the paired RGB capture before compression.
+Clouds are saved individually, with no frame fusion or filtering.
+
+A background worker drains all queued clouds when an episode ends. If disk writing
+fails or its 30-frame queue fills, recording reports an error and the episode is
+marked failed rather than silently dropping clouds. Budget roughly 100 MB/s at
+640×480 and 30 FPS (actual size depends on valid depth coverage). Calibration is
+also saved in episode metadata even when cloud recording is off.
+
 | Option | Default | Meaning |
 |---|---|---|
 | `--task` | required | Task description stored with every episode of this run (becomes the LeRobot task text) |
 | `--notes` | empty | Free-form notes stored in each episode's `meta.json` |
 | `--root` | `data/raw` | Where run folders are created |
+| `--resume-run` | unset | Append to an existing run directory, continuing after its highest episode number; existing episodes are never overwritten |
 | `-c / --config` | `configs/record.yaml` | Configuration file |
+| `--no-realsense` | off | Ignore the configured RealSense for this run |
+| `--record-cloud` / `--no-record-cloud` | YAML setting (off) | Enable/disable per-frame colored PLY recording |
 
 What happens:
 
@@ -166,9 +219,15 @@ data/raw/20261027-192407/              ← one record run
 │   ├── robot.jsonl                    ← every robot message, one JSON per line
 │   └── video/
 │       ├── left.mkv                   ← left eye, H.264, every captured frame
-│       ├── left_timestamps.txt        ← capture time (ns) of each frame, line i = frame i
+│       ├── left_timestamps.txt        ← host time after decode (ns), line i = frame i
+│       ├── left_driver_timestamps.csv ← driver metadata and host stage times, row i = frame i
 │       ├── right.mkv
-│       └── right_timestamps.txt
+│       ├── right_timestamps.txt
+│       ├── right_driver_timestamps.csv
+│       ├── external.mkv              ← D435i color, H.264
+│       ├── external_depth.mkv        ← color-aligned uint16 depth, lossless FFV1
+│       ├── external_timestamps.txt   ← one timestamp per RGB-D frameset
+│       └── external_sensor_timestamps.csv ← sensor times and frame numbers per frameset
 └── episode_2/
     └── ...
 ```
@@ -193,6 +252,76 @@ A line of `robot.jsonl`:
 
 Raw data is the master copy: `convert` only reads it, and you can convert it
 again at any time.
+
+### Stereo driver timestamp diagnostics
+
+New recordings also save `video/left_driver_timestamps.csv` and
+`video/right_driver_timestamps.csv`. Each CSV row describes exactly the same
+frame as the corresponding video index and line in `<side>_timestamps.txt`.
+The recorder reads V4L2 MMAP buffers directly so that image,
+sequence and timestamp all come from the **same** `VIDIOC_DQBUF` result; OpenCV
+is used to decode the copied image payload.
+The currently supported capture formats are MJPG/JPEG/YUYV/UYVY (single plane).
+The driver may allocate more buffers than the two requested; `buffer_count`
+is recorded in camera metadata.
+
+| CSV field | Meaning |
+|---|---|
+| `frame_index` | Zero-based frame index within this episode's saved video |
+| `driver_timestamp_ns` | Original V4L2 buffer timeval converted to ns; source precision is microseconds |
+| `driver_sequence` | Driver's 32-bit stream sequence; it does not restart for each episode and is not a shared left/right frame ID |
+| `driver_flags` | Original flags returned by the driver |
+| `driver_clock` | `monotonic`, `unknown`, `copy`, or unrecognized flag bits |
+| `driver_timestamp_source` | Driver declares `start_of_exposure`, `end_of_frame`, or unrecognized bits |
+| `sequence_step` | Sequence increment since the preceding captured frame, modulo 2^32 |
+| `host_dequeue_ns` | PC wall-clock time immediately after DQBUF, before copying/decoding |
+| `host_dequeue_monotonic_ns` | Paired PC monotonic time (midpoint of two clock reads surrounding the wall-clock read) |
+| `host_clock_pair_span_ns` | Time span of that clock pairing; use to assess its uncertainty |
+| `host_decode_complete_ns` | PC wall-clock time after decode; also written to the original timestamps.txt used by convert |
+| `host_decode_complete_monotonic_ns` | PC monotonic time immediately after the preceding wall-clock read |
+| `driver_to_dequeue_ns` | Dequeue minus driver time, **only** when the driver reports MONOTONIC and a positive timestamp; otherwise blank |
+| `encoder_write_start_monotonic_ns`, `encoder_write_end_monotonic_ns` | Encoding pipe write boundaries, useful for identifying blocking |
+
+`MONOTONIC` can be compared with host monotonic time, **not** directly with
+ROS epoch header time. UNKNOWN/COPY must not be guessed to be realtime.
+`start_of_exposure` is a **driver declaration**. An HDMI capture card reporting
+this flag does not prove that it reports the upstream endoscope sensor's exact
+exposure time or that both sensors are hardware synchronized. `end_of_frame`
+denotes receipt of the frame's last pixel. See Linux V4L2's buffer timestamp
+and timestamp-source definitions in the official userspace API documentation:
+
+```text
+https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/buffer.html
+```
+
+To analyze one **newly recorded** episode after it has been saved:
+
+```bash
+cd /home/zhang/zst/Open-H-Embodiment-dVRK-v2
+.venv/bin/python -m dvrk_lerobot.tools.stereo_timing \
+  data/raw/<run>/episode_1 \
+  --tolerance-ms 15 \
+  --output /tmp/stereo_timing.json
+```
+
+The command reads the files, checks video/CSV/legacy timestamp correspondence,
+and compares stereo timing at driver, dequeue and decode stages. It also
+reports frame-sequence gaps, driver error flags, decode delay, encoder write
+duration, and the delay difference for the **same driver-matched frame pairs**.
+It refuses cross-driver comparisons when clocks/sources are incompatible.
+
+- A large difference already in driver timestamps places the difference at or
+  before that driver timestamp boundary (source/card/driver); these logs alone
+  cannot separate those layers.
+- Close driver timestamps followed by a large host difference points to delay
+  after the driver timestamp boundary; compare dequeue/decode/encoder timings.
+- A jump in frame sequence means driver frame numbers went unobserved. It does
+  not, by itself, diagnose a broken camera.
+
+Convert still uses the original after-decode host times and current tolerances.
+Adding diagnostics does not establish exposure synchronization or eliminate
+alignment gaps. Older recordings lack driver metadata and cannot be analyzed
+retroactively by this command.
 
 ### 3.5 Convert to LeRobot
 
@@ -254,11 +383,12 @@ The robot (about 100 Hz per topic) and the two cameras (about 30 fps each) run
 independently. `convert` places them all on one fixed-rate grid, so frame *k* is
 `k / fps` seconds into the episode:
 
-1. **Grid.** One slot every `1 / fps` seconds, shared by both eyes, covering the
-   time when both cameras were recording.
-2. **Video.** Each eye gives a slot the first frame that arrived inside it. A
+1. **Grid.** One slot every `1 / fps` seconds, shared by both eyes (and the D435i
+   when present), covering the time when every camera was recording.
+2. **Video.** Each camera gives a slot the first frame that arrived inside it. A
    slot with no new frame repeats the previous picture, so a dropped frame does
-   not shorten the episode.
+   not shorten the episode. D435i color and depth share a frameset, so they
+   always use the same index.
 3. **Robot state.** For each arm, the latest `jp`, `jaw` and `cp` samples received
    at or before the slot's time are attached. Receive time is used because the
    camera frames are stamped on the same PC clock. ROS header stamps are kept in
@@ -267,8 +397,9 @@ independently. `convert` places them all on one fixed-rate grid, so frame *k* is
    `timestamp = frame_index / fps` (what LeRobot expects). The true capture times
    stay in the raw folder.
 
-Frames are never removed for being outside a tolerance. `stereo_tolerance_ms` and
-`robot_tolerance_ms` only set what the `convert` output counts.
+Frames are never removed for being outside a tolerance. `stereo_tolerance_ms`,
+`external_tolerance_ms` and `robot_tolerance_ms` only set what the `convert`
+output counts.
 
 Raw recordings made before this grid was added can be converted again without
 recording them again. Datasets already converted keep the old timing: they
@@ -310,7 +441,8 @@ data/lerobot/needle_pick/
 │   └── episode_000001.parquet
 └── videos/chunk-000/
     ├── observation.images.left/episode_000000.mp4 ...
-    └── observation.images.right/episode_000000.mp4 ...
+    ├── observation.images.right/episode_000000.mp4 ...
+    └── observation.images.external/episode_000000.mp4 ...
 ```
 
 | Feature | Type / shape | Content |
@@ -319,6 +451,8 @@ data/lerobot/needle_pick/
 | `action` | float32 `[28]` | next state (`state[t+1]`, last row repeated); a placeholder, see Limitations |
 | `observation.images.left` | video `[1080, 1920, 3]` | H.264, yuv420p, 30 fps |
 | `observation.images.right` | video `[1080, 1920, 3]` | H.264, yuv420p, 30 fps |
+| `observation.images.external` | video `[480, 640, 3]` by default | D435i color, H.264 |
+| `observation.depth.external` | float32 `[480, 640]` by default | Exact raw uint16 depth integers in Parquet; metres = value × `depth_scale_m_per_unit` |
 | `timestamp` | float32 | `frame_index / fps` |
 | `frame_index` | int64 | `0..N-1` within the episode |
 | `episode_index` | int64 | episode number in the dataset |
@@ -377,6 +511,7 @@ print(ds)
 sample = ds[0]
 print(sample["observation.state"].shape)          # torch.Size([28])
 print(sample["observation.images.left"].shape)    # torch.Size([3, 1080, 1920])
+depth_m = sample["observation.depth.external"] * ds.meta.features["observation.depth.external"]["info"]["depth_scale_m_per_unit"]
 ```
 
 lerobot 0.4+ only reads v3.0. Export with `--format v3.0` for those versions.
@@ -408,7 +543,7 @@ other block.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `device` | `/dev/video0` (left), `/dev/video2` (right) | V4L2 device. Swap them if left and right are reversed |
+| `device` | `/dev/video0` (left), `/dev/video2` (right) | V4L2 device; confirm paths with `v4l2-ctl --list-devices` after reconnecting cameras and swap if eyes are reversed |
 | `width`, `height` | 1920, 1080 | Must be a mode the capture card supports |
 | `fps` | 30 | Must equal `dataset.fps` |
 | `fourcc` | `MJPG` | Pixel format requested from the card |
@@ -417,8 +552,17 @@ other block.
 List the modes your card supports:
 
 ```bash
-ffmpeg -hide_banner -f v4l2 -list_formats all -i /dev/video0
+ffmpeg -hide_banner -f v4l2 -list_formats all -i /dev/video6
 ```
+
+### `realsense`
+
+The optional `realsense` block enables one D435i RGB-D observation. Its `width`,
+`height`, and `fps` select both color and depth streams; `fps` must match
+`dataset.fps`. `serial: null` selects the first connected device. The default
+640x480 at 30 fps is a conservative starting point. If this block is omitted,
+the existing stereo-only recording and conversion remain available. Use a
+stereo-only config when converting older raw episodes without RGB-D.
 
 ### `dataset`
 
@@ -435,6 +579,7 @@ ffmpeg -hide_banner -f v4l2 -list_formats all -i /dev/video0
 | Key | Default | Meaning |
 |---|---|---|
 | `stereo_tolerance_ms` | 25 | `convert` counts frames whose left and right pictures are further apart than this |
+| `external_tolerance_ms` | 25 | `convert` counts frames whose RGB-D frameset is further than this from the left picture |
 | `robot_tolerance_ms` | 25 | `convert` counts frames whose held robot sample is older than this |
 
 Changing `dataset` or `alignment` only needs a new `convert`; the raw data does
@@ -463,7 +608,8 @@ not have to be recorded again.
 |---|---|---|
 | `ModuleNotFoundError: rclpy` | `.venv` created without system packages | `rm -rf .venv && ./scripts/setup_env.sh` |
 | `no data within 20s; missing: /PSM1/...` | dVRK console not running, or a topic name differs | Start the console; `ros2 topic list \| grep PSM`; fix `arms` in the config |
-| `cannot open /dev/video0` | Device busy or no permission | Close other camera apps (including another recorder); `sudo usermod -aG video $USER`, then log in again |
+| `cannot open /dev/video6` | Device busy or no permission | Close other camera apps (including another recorder); check the device path and permissions |
+| Stereo preview shows `No Signal` | Capture card has no upstream video input | Check endoscope output, HDMI cables and capture-card inputs before recording |
 | `negotiated 1280x720, expected 1920x1080` | Mode not supported by the card | Pick a listed mode (section 6) |
 | Preview window does not appear / Qt `xcb` error | No display (e.g. SSH session) | Run from the desktop session, or `ssh -X` |
 | Keys do nothing | Neither the preview window nor the terminal has focus | Click the preview window or the terminal |
@@ -477,7 +623,7 @@ not have to be recorded again.
 Check a single camera without the recorder:
 
 ```bash
-ffplay -f v4l2 -input_format mjpeg -video_size 1920x1080 -framerate 30 /dev/video0
+ffplay -f v4l2 -input_format mjpeg -video_size 1920x1080 -framerate 30 /dev/video6
 ```
 
 ---
@@ -487,8 +633,9 @@ ffplay -f v4l2 -input_format mjpeg -video_size 1920x1080 -framerate 30 /dev/vide
 - **`action` is a placeholder.** It is the next measured state, not the
   operator's command. Record a command topic (for example `/PSM1/setpoint_js`)
   before training a policy that needs true actions.
-- **Software stereo sync.** Each eye is timestamped by the PC when its frame
-  arrives; the capture cards are not hardware-synchronised.
+- **Software stereo sync.** Convert uses PC time after each frame is decoded.
+  Driver timestamps are now logged for diagnostics. The recorder does not
+  configure or verify hardware synchronization of the source or capture cards.
 - **No camera calibration.** Intrinsics, stereo extrinsics and
   camera-to-robot registration are not stored.
 - **Positions only.** Joint velocities, efforts and other CRTK topics are not

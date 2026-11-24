@@ -53,6 +53,8 @@ def test_repository_config_is_valid() -> None:
     assert config.dataset.fps == 30
     assert config.arms[0].name == "PSM1"
     assert config.cameras["left"].device == "/dev/video0"
+    assert config.cameras["right"].device == "/dev/video2"
+    assert config.realsense is not None
 
 
 def test_missing_jaw_topic_is_rejected() -> None:

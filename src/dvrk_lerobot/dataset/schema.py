@@ -36,7 +36,8 @@ def state_names(arms: Sequence[ArmConfig], joint_names: Mapping[str, Sequence[st
 
 
 def build_features(
-    state_names_: Sequence[str], videos: Mapping[str, Mapping[str, Any]]
+    state_names_: Sequence[str], videos: Mapping[str, Mapping[str, Any]],
+    depth_shape: tuple[int, int] | None = None, depth_scale: float | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Return info.json features, with video features inserted before defaults."""
     names = list(state_names_)
@@ -44,7 +45,7 @@ def build_features(
         "observation.state": {"dtype": "float32", "shape": [len(names)], "names": names},
         "action": {"dtype": "float32", "shape": [len(names)], "names": list(names)},
     }
-    for side in ("left", "right"):
+    for side in videos:
         info = videos[side]
         features[f"observation.images.{side}"] = {
             "dtype": "video",
@@ -61,6 +62,20 @@ def build_features(
                 "has_audio": False,
             },
         }
+    if depth_shape is not None:
+        if depth_scale is None or depth_scale <= 0:
+            raise ValueError("depth_scale must be positive for RGB-D datasets")
+        features["observation.depth.external"] = {
+            "dtype": "float32",
+            "shape": list(depth_shape),
+            "names": ["height", "width"],
+            "info": {
+                "representation": "uint16_raw_as_float32",
+                "depth_scale_m_per_unit": float(depth_scale),
+                "invalid_value": 0,
+                "aligned_to": "observation.images.external",
+            },
+        }
     features.update({key: dict(value) for key, value in DEFAULT_FEATURES.items()})
     return features
 
@@ -75,7 +90,7 @@ def info_dict(
     total_tasks: int,
 ) -> dict[str, Any]:
     """Build the complete meta/info.json payload."""
-    total_videos = total_episodes * 2
+    total_videos = total_episodes * sum(ft["dtype"] == "video" for ft in features.values())
     total_chunks = (total_episodes + CHUNKS_SIZE - 1) // CHUNKS_SIZE if total_episodes else 0
     return {
         "codebase_version": CODEBASE_VERSION,
