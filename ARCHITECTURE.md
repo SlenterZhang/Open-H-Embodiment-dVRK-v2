@@ -6,8 +6,9 @@ v2.1 episode.
 
 The original sections below describe the stereo-only base pipeline. The RGB-D
 extension adds one D435i frameset stream (`acquire/realsense.py`), storing color
-as H.264 and color-aligned uint16 depth as lossless FFV1. `align/sync.py`
-matches each stereo pair to one RGB-D frameset, and `dataset/writer.py` writes
+(bgr0) and color-aligned uint16 depth both as lossless FFV1, so point clouds can
+be rebuilt exactly offline (`tools/reconstruct_cloud.py`). `align/sync.py`
+places the RGB-D framesets on the same slot grid as the stereo eyes, and `dataset/writer.py` writes
 `observation.images.external` plus exact depth integers in the float32
 `observation.depth.external` Parquet array. See `README.md` for the current
 configuration and data layout.

@@ -16,11 +16,14 @@ The D435i is configured in `configs/record.yaml` under `realsense`. It uses one
 as the two existing endoscope cameras. Select a serial number in the config if
 multiple RealSense cameras are connected.
 
-Depth is stored as raw unsigned 16-bit values in a lossless FFV1 MKV during
-recording. `meta.json` records `realsense.depth_scale` in metres per raw unit;
-zero is an invalid depth pixel. The depth frame is aligned to the D435i color
-image using the device's internal calibration, but calibration parameters are
-not written to the dataset.
+Both D435i streams are stored **losslessly** during recording, in FFV1 MKVs:
+color as 8-bit BGR and depth as raw unsigned 16-bit values. Depth is aligned to
+the color image by the device. `meta.json` records `realsense.depth_scale`
+(metres per raw unit; zero is an invalid pixel) and the color intrinsics at
+recording time. Together these rebuild the exact colored point cloud of every
+frame offline (see [Point clouds](#point-clouds)), so clouds do not need to be
+stored. The LeRobot dataset gets the color video and the exact depth integers,
+not the intrinsics.
 
 It then aligns both streams in time and writes them in the LeRobot format.
 
@@ -55,7 +58,7 @@ Design details (threading, timing model, file formats) are in
 | dVRK | ROS 2 workspace built at `~/ros2_ws` |
 | Python | 3.10 (the system Python used by ROS Humble) |
 | uv | 0.9 or newer |
-| ffmpeg | System package with `libx264` (`sudo apt install ffmpeg`) |
+| ffmpeg | System package with `libx264` and FFV1 (`sudo apt install ffmpeg`) |
 | Cameras | Two V4L2 endoscope devices plus one D435i RGB-D camera |
 
 ## 2. One-time setup
@@ -137,28 +140,6 @@ Use `--no-realsense` with `./scripts/doctor.sh` and `./scripts/convert.sh` as
 well when checking or converting stereo-only sessions. Keep RGB-D and
 stereo-only episodes in separate converted datasets.
 
-Optional live colored point clouds (off by default):
-
-```bash
-./scripts/record.sh --task "needle pick" --record-cloud
-./scripts/record.sh --task "needle pick" --no-record-cloud
-```
-
-These flags override `realsense.record_cloud` in the YAML. Cloud recording requires
-RealSense and cannot be enabled with `--no-realsense`. Each episode gets
-`cloud/frame_000000.ply`, etc., in binary PLY format, plus `cloud/timestamps.csv`
-and `cloud/metadata.json` with calibration and the completed frame count.
-Cloud indices and timestamps match the external RGB-D frames. Coordinates are
-meters in the color camera frame (x right, y down, z forward); invalid zero-depth
-pixels are omitted. Colors come from the paired RGB capture before compression.
-Clouds are saved individually, with no frame fusion or filtering.
-
-A background worker drains all queued clouds when an episode ends. If disk writing
-fails or its 30-frame queue fills, recording reports an error and the episode is
-marked failed rather than silently dropping clouds. Budget roughly 100 MB/s at
-640×480 and 30 FPS (actual size depends on valid depth coverage). Calibration is
-also saved in episode metadata even when cloud recording is off.
-
 | Option | Default | Meaning |
 |---|---|---|
 | `--task` | required | Task description stored with every episode of this run (becomes the LeRobot task text) |
@@ -167,7 +148,7 @@ also saved in episode metadata even when cloud recording is off.
 | `--resume-run` | unset | Append to an existing run directory, continuing after its highest episode number; existing episodes are never overwritten |
 | `-c / --config` | `configs/record.yaml` | Configuration file |
 | `--no-realsense` | off | Ignore the configured RealSense for this run |
-| `--record-cloud` / `--no-record-cloud` | YAML setting (off) | Enable/disable per-frame colored PLY recording |
+| `--record-cloud` / `--no-record-cloud` | YAML setting (off) | Also write per-frame colored PLYs while recording (usually unnecessary, see [Point clouds](#point-clouds)) |
 
 What happens:
 
@@ -207,6 +188,33 @@ Tips:
   recorder**. Click another window before typing elsewhere.
 - One run has one `--task`. For a different task, quit and start a new run.
 
+#### Point clouds
+
+You normally do **not** need to record point clouds. The lossless color and
+depth videos plus the intrinsics in `meta.json` rebuild them byte for byte, and
+take about 10x less disk than PLY files (which need roughly 100 MB/s).
+
+Rebuild the clouds of one raw episode when you need them:
+
+```bash
+uv run --no-sync python -m dvrk_lerobot.tools.reconstruct_cloud \
+    data/raw/<run>/episode_1 --output data/clouds/<run>/episode_1
+```
+
+This writes `frame_000000.ply`, ... (one per RGB-D frame, raw frame order) and a
+`manifest.json` with timestamps and point counts. It uses the recording-time
+intrinsics from `meta.json`; `--calibration <file.json>` uses other intrinsics
+instead. Coordinates are metres in the color camera frame (x right, y down,
+z forward); zero-depth pixels are omitted; no fusion or filtering is applied.
+
+To write clouds live during recording anyway, pass `--record-cloud` (or set
+`realsense.record_cloud: true`; `--no-record-cloud` overrides it). Each episode
+then also gets `cloud/frame_*.ply`, `cloud/timestamps.csv` and
+`cloud/metadata.json`. A background worker writes them; if the disk cannot keep
+up (30-frame queue full) the episode is marked failed rather than dropping
+clouds. Cloud recording needs the RealSense and cannot be combined with
+`--no-realsense`.
+
 ### 3.4 Where the raw data goes
 
 Each run creates one folder named by the time of its first episode, with one
@@ -217,17 +225,18 @@ data/raw/20261027-192407/              ← one record run
 ├── episode_1/
 │   ├── meta.json                      ← task, status, cameras, topics, joint names, counts
 │   ├── robot.jsonl                    ← every robot message, one JSON per line
-│   └── video/
-│       ├── left.mkv                   ← left eye, H.264, every captured frame
-│       ├── left_timestamps.txt        ← host time after decode (ns), line i = frame i
-│       ├── left_driver_timestamps.csv ← driver metadata and host stage times, row i = frame i
-│       ├── right.mkv
-│       ├── right_timestamps.txt
-│       ├── right_driver_timestamps.csv
-│       ├── external.mkv              ← D435i color, H.264
-│       ├── external_depth.mkv        ← color-aligned uint16 depth, lossless FFV1
-│       ├── external_timestamps.txt   ← one timestamp per RGB-D frameset
-│       └── external_sensor_timestamps.csv ← sensor times and frame numbers per frameset
+│   ├── video/
+│   │   ├── left.mkv                   ← left eye, H.264, every captured frame
+│   │   ├── left_timestamps.txt        ← host time after decode (ns), line i = frame i
+│   │   ├── left_driver_timestamps.csv ← driver metadata and host stage times, row i = frame i
+│   │   ├── right.mkv
+│   │   ├── right_timestamps.txt
+│   │   ├── right_driver_timestamps.csv
+│   │   ├── external.mkv              ← D435i color, lossless FFV1 (bgr0)
+│   │   ├── external_depth.mkv        ← color-aligned uint16 depth, lossless FFV1
+│   │   ├── external_timestamps.txt   ← one timestamp per RGB-D frameset
+│   │   └── external_sensor_timestamps.csv ← sensor times and frame numbers per frameset
+│   └── cloud/                     ← per-frame PLYs, only with --record-cloud
 └── episode_2/
     └── ...
 ```
@@ -451,7 +460,7 @@ data/lerobot/needle_pick/
 | `action` | float32 `[28]` | next state (`state[t+1]`, last row repeated); a placeholder, see Limitations |
 | `observation.images.left` | video `[1080, 1920, 3]` | H.264, yuv420p, 30 fps |
 | `observation.images.right` | video `[1080, 1920, 3]` | H.264, yuv420p, 30 fps |
-| `observation.images.external` | video `[480, 640, 3]` by default | D435i color, H.264 |
+| `observation.images.external` | video `[480, 640, 3]` by default | D435i color, re-encoded to H.264 yuv420p by `convert` |
 | `observation.depth.external` | float32 `[480, 640]` by default | Exact raw uint16 depth integers in Parquet; metres = value × `depth_scale_m_per_unit` |
 | `timestamp` | float32 | `frame_index / fps` |
 | `frame_index` | int64 | `0..N-1` within the episode |
@@ -557,12 +566,20 @@ ffmpeg -hide_banner -f v4l2 -list_formats all -i /dev/video6
 
 ### `realsense`
 
-The optional `realsense` block enables one D435i RGB-D observation. Its `width`,
-`height`, and `fps` select both color and depth streams; `fps` must match
-`dataset.fps`. `serial: null` selects the first connected device. The default
-640x480 at 30 fps is a conservative starting point. If this block is omitted,
-the existing stereo-only recording and conversion remain available. Use a
-stereo-only config when converting older raw episodes without RGB-D.
+The optional `realsense` block enables one D435i RGB-D observation. If it is
+omitted, recording and conversion are stereo-only. Use a stereo-only config (or
+`--no-realsense`) when converting older raw episodes without RGB-D.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `serial` | `null` | Device serial; `null` selects the first connected D435i |
+| `width`, `height` | 640, 480 | Resolution of both color and depth |
+| `fps` | 30 | Must equal `dataset.fps` |
+| `record_cloud` | `false` | Also write per-frame PLYs while recording; see [Point clouds](#point-clouds) |
+
+Raw color and depth are always lossless FFV1; there is no quality setting.
+Raw episodes recorded before 2026-11-24 have H.264 color (`color_crf` in their
+`meta.json`); their geometry still rebuilds exactly, colors approximately.
 
 ### `dataset`
 
@@ -592,6 +609,9 @@ not have to be recorded again.
 | | Size |
 |---|---|
 | Raw recording, 1080p stereo, `crf: 18` | about 18 MB/s, **about 65 GB per hour** |
+| Raw D435i color, 640x480, lossless | about 5 MB/s (depends on the scene) |
+| Raw D435i depth, 640x480, lossless | about 1–2 MB/s |
+| Raw point clouds (`--record-cloud`) | about 100 MB/s, **about 350 GB per hour**; avoid |
 | Dataset, 1080p stereo, `video_crf: 18` | about 16 MB/s (for example, 459 MB for 28 s) |
 
 - Each camera is encoded to H.264 while recording, using about 2 CPU cores per

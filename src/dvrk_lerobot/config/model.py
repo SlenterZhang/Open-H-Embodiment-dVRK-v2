@@ -38,7 +38,6 @@ class RealSenseConfig:
     width: int
     height: int
     fps: int
-    color_crf: int
     record_cloud: bool = False
 
 

@@ -42,7 +42,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("episode", type=Path)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--calibration", type=Path, required=True)
+    parser.add_argument("--calibration", type=Path,
+                        help="intrinsics JSON; default: the recording-time intrinsics in meta.json")
     parser.add_argument("--read-camera-calibration", action="store_true",
                         help="Save current matching camera calibration and exit")
     args = parser.parse_args()
@@ -51,13 +52,18 @@ def main() -> None:
     if not info["depth_aligned_to_color"]:
         raise ValueError("This exporter requires depth aligned to color")
     if args.read_camera_calibration:
+        if args.calibration is None:
+            parser.error("--read-camera-calibration needs --calibration")
         calibration = camera_calibration(info)
         args.calibration.parent.mkdir(parents=True, exist_ok=True)
         with args.calibration.open("x") as handle:
             json.dump(calibration, handle, indent=2)
         print(json.dumps(calibration, indent=2))
         return
-    calibration = json.loads(args.calibration.read_text())
+    if args.calibration is None:
+        calibration = {"serial": info["serial"], **info["color_intrinsics"]}
+    else:
+        calibration = json.loads(args.calibration.read_text())
     for key in ("serial", "width", "height"):
         if calibration[key] != info[key]:
             raise ValueError(f"Calibration {key} does not match recording")

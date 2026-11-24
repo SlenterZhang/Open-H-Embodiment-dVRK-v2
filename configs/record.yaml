@@ -48,7 +48,6 @@ realsense:
   width: 640
   height: 480
   fps: 30
-  color_crf: 18
   record_cloud: false  # Override with --record-cloud / --no-record-cloud.
 
 alignment:

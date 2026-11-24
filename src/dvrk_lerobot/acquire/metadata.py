@@ -61,7 +61,7 @@ def build_meta(
             "width": config.realsense.width,
             "height": config.realsense.height,
             "fps": config.realsense.fps,
-            "color_crf": config.realsense.color_crf,
+            "color_codec": "ffv1_bgr0",
             "record_cloud": config.realsense.record_cloud,
             "color_intrinsics": camera_info["external"].get("color_intrinsics"),
             "depth_scale": camera_info["external"]["depth_scale"],

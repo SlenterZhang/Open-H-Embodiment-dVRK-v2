@@ -39,6 +39,21 @@ def start_encoder(
         raise VideoError(f"cannot start ffmpeg for {destination}: {exc}") from exc
 
 
+def start_lossless_encoder(destination: Path, *, width: int, height: int, fps: int) -> subprocess.Popen:
+    """Start ffmpeg reading raw BGR frames on stdin and writing lossless FFV1 bgr0."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        _binary("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
+        "-framerate", str(fps), "-i", "-", "-vsync", "passthrough",
+        "-c:v", "ffv1", "-level", "3", "-pix_fmt", "bgr0", str(destination),
+    ]  # fmt: skip
+    try:
+        return subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise VideoError(f"cannot start ffmpeg for {destination}: {exc}") from exc
+
+
 def finish_encoder(process: subprocess.Popen, action: str) -> None:
     """Close stdin, wait for ffmpeg to flush, and raise if it failed."""
     _, stderr = process.communicate(timeout=600)

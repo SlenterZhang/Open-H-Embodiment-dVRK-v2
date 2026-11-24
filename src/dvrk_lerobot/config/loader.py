@@ -151,7 +151,7 @@ def _parse_realsense(raw: Any, fps: int) -> RealSenseConfig | None:
     if raw is None:
         return None
     item = _mapping(raw, "realsense")
-    _only(item, {"serial", "width", "height", "fps", "color_crf", "record_cloud"}, "realsense")
+    _only(item, {"serial", "width", "height", "fps", "record_cloud"}, "realsense")
     width = _integer(item.get("width"), "realsense.width", 16, 8192)
     height = _integer(item.get("height"), "realsense.height", 16, 8192)
     if width % 2 or height % 2:
@@ -171,7 +171,6 @@ def _parse_realsense(raw: Any, fps: int) -> RealSenseConfig | None:
         width=width,
         height=height,
         fps=camera_fps,
-        color_crf=_integer(item.get("color_crf", 18), "realsense.color_crf", 0, 51),
     )
 
 

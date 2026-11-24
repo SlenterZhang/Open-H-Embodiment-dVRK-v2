@@ -117,7 +117,7 @@ class RGBDTests(unittest.TestCase):
     def test_rgbd_export_has_three_videos_and_depth(self) -> None:
         images = [np.full((16, 16), 1000 + i, np.uint16) for i in range(2)]
         config = load_config(Path(__file__).parents[2] / "configs" / "record.yaml")
-        config = replace(config, realsense=RealSenseConfig(None, 16, 16, 30, 18))
+        config = replace(config, realsense=RealSenseConfig(None, 16, 16, 30))
         episode = Episode(
             session=Path("synthetic"), task="pick",
             state=np.zeros((2, 1), np.float32), action=np.zeros((2, 1), np.float32),
