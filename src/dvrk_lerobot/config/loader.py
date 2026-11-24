@@ -151,7 +151,7 @@ def _parse_realsense(raw: Any, fps: int) -> RealSenseConfig | None:
     if raw is None:
         return None
     item = _mapping(raw, "realsense")
-    _only(item, {"serial", "width", "height", "fps", "record_cloud"}, "realsense")
+    _only(item, {"serial", "width", "height", "fps", "record_cloud", "color_lossless"}, "realsense")
     width = _integer(item.get("width"), "realsense.width", 16, 8192)
     height = _integer(item.get("height"), "realsense.height", 16, 8192)
     if width % 2 or height % 2:
@@ -165,8 +165,12 @@ def _parse_realsense(raw: Any, fps: int) -> RealSenseConfig | None:
     record_cloud = item.get("record_cloud", False)
     if not isinstance(record_cloud, bool):
         raise ConfigError("realsense.record_cloud must be a boolean")
+    color_lossless = item.get("color_lossless", False)
+    if not isinstance(color_lossless, bool):
+        raise ConfigError("realsense.color_lossless must be a boolean")
     return RealSenseConfig(
         record_cloud=record_cloud,
+        color_lossless=color_lossless,
         serial=serial,
         width=width,
         height=height,

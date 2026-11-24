@@ -4,11 +4,13 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from dvrk_lerobot.acquire.camera import CameraError
+from dvrk_lerobot.acquire.camera import RAW_PRESET, CameraError
 from dvrk_lerobot.acquire.cloud import CloudWriter
 from dvrk_lerobot.acquire.rgbd_log import TimestampLog
 from dvrk_lerobot.dataset import depth
-from dvrk_lerobot.dataset.video import finish_encoder, start_lossless_encoder
+from dvrk_lerobot.dataset.video import finish_encoder, start_encoder, start_lossless_encoder
+
+COLOR_CRF = 18  # lossy raw color; dataset video is re-encoded to H.264 anyway
 
 
 @dataclass
@@ -26,9 +28,11 @@ class Episode:
         processes = []
         log = None
         try:
-            processes.append(start_lossless_encoder(
-                color, width=config.width, height=config.height, fps=config.fps,
-            ))
+            size = {"width": config.width, "height": config.height, "fps": config.fps}
+            processes.append(
+                start_lossless_encoder(color, **size) if config.color_lossless
+                else start_encoder(color, **size, crf=COLOR_CRF, preset=RAW_PRESET)
+            )
             processes.append(depth.start_encoder(
                 depth_path, config.width, config.height, config.fps,
             ))

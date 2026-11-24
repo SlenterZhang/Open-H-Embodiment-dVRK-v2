@@ -39,6 +39,7 @@ class RealSenseConfig:
     height: int
     fps: int
     record_cloud: bool = False
+    color_lossless: bool = False
 
 
 @dataclass(frozen=True)

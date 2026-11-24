@@ -49,6 +49,9 @@ realsense:
   height: 480
   fps: 30
   record_cloud: false  # Override with --record-cloud / --no-record-cloud.
+  # false: H.264 color (small; the dataset re-encodes to H.264 anyway).
+  # true: lossless FFV1 color (~5 MB/s), only for exact colors in rebuilt point clouds.
+  color_lossless: false
 
 alignment:
   # These only set what `convert` reports; no frame is removed for exceeding them.

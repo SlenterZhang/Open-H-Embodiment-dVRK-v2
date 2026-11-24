@@ -16,13 +16,14 @@ The D435i is configured in `configs/record.yaml` under `realsense`. It uses one
 as the two existing endoscope cameras. Select a serial number in the config if
 multiple RealSense cameras are connected.
 
-Both D435i streams are stored **losslessly** during recording, in FFV1 MKVs:
-color as 8-bit BGR and depth as raw unsigned 16-bit values. Depth is aligned to
-the color image by the device. `meta.json` records `realsense.depth_scale`
+D435i depth is stored **losslessly** during recording, as raw unsigned 16-bit
+values in an FFV1 MKV, aligned to the color image by the device. Color is H.264
+by default (tiny; the dataset re-encodes it to H.264 anyway), or lossless FFV1
+with `realsense.color_lossless: true`. `meta.json` records `realsense.depth_scale`
 (metres per raw unit; zero is an invalid pixel) and the color intrinsics at
-recording time. Together these rebuild the exact colored point cloud of every
+recording time. Together these rebuild the exact point-cloud geometry of every
 frame offline (see [Point clouds](#point-clouds)), so clouds do not need to be
-stored. The LeRobot dataset gets the color video, the exact depth integers, and
+stored; their colors are exact only with lossless color. The LeRobot dataset gets the color video, the exact depth integers, and
 the depth scale and intrinsics in `info.json`, so it rebuilds the same clouds on
 its own.
 
@@ -191,9 +192,10 @@ Tips:
 
 #### Point clouds
 
-You normally do **not** need to record point clouds. The lossless color and
-depth videos plus the intrinsics in `meta.json` rebuild them byte for byte, and
-take about 10x less disk than PLY files (which need roughly 100 MB/s).
+You normally do **not** need to record point clouds. The lossless depth video
+plus the intrinsics in `meta.json` rebuild their geometry exactly, at a small
+fraction of the disk PLY files need (roughly 100 MB/s). Point colors come from
+the color video: exact with `color_lossless: true`, close otherwise.
 
 Rebuild the clouds of one raw episode when you need them:
 
@@ -233,7 +235,7 @@ data/raw/20261027-192407/              ← one record run
 │   │   ├── right.mkv
 │   │   ├── right_timestamps.txt
 │   │   ├── right_driver_timestamps.csv
-│   │   ├── external.mkv              ← D435i color, lossless FFV1 (bgr0)
+│   │   ├── external.mkv              ← D435i color, H.264 (FFV1 with color_lossless)
 │   │   ├── external_depth.mkv        ← color-aligned uint16 depth, lossless FFV1
 │   │   ├── external_timestamps.txt   ← one timestamp per RGB-D frameset
 │   │   └── external_sensor_timestamps.csv ← sensor times and frame numbers per frameset
@@ -577,10 +579,10 @@ omitted, recording and conversion are stereo-only. Use a stereo-only config (or
 | `width`, `height` | 640, 480 | Resolution of both color and depth |
 | `fps` | 30 | Must equal `dataset.fps` |
 | `record_cloud` | `false` | Also write per-frame PLYs while recording; see [Point clouds](#point-clouds) |
+| `color_lossless` | `false` | `false`: raw color H.264 (CRF 18, ~0.06 MB/s). `true`: lossless FFV1 (~5 MB/s), only needed for exact colors in rebuilt point clouds; the dataset is the same either way |
 
-Raw color and depth are always lossless FFV1; there is no quality setting.
-Raw episodes recorded before 2026-11-24 have H.264 color (`color_crf` in their
-`meta.json`); their geometry still rebuilds exactly, colors approximately.
+Raw depth is always lossless FFV1. `meta.json` records the color codec as
+`realsense.color_codec` (older episodes record `color_crf` instead).
 
 ### `dataset`
 
@@ -610,7 +612,7 @@ not have to be recorded again.
 | | Size |
 |---|---|
 | Raw recording, 1080p stereo, `crf: 18` | about 18 MB/s, **about 65 GB per hour** |
-| Raw D435i color, 640x480, lossless | about 5 MB/s (depends on the scene) |
+| Raw D435i color, 640x480 | about 0.06 MB/s (H.264); about 5 MB/s with `color_lossless: true` |
 | Raw D435i depth, 640x480, lossless | about 1–2 MB/s |
 | Raw point clouds (`--record-cloud`) | about 100 MB/s, **about 350 GB per hour**; avoid |
 | Dataset, 1080p stereo, `video_crf: 18` | about 16 MB/s (for example, 459 MB for 28 s) |
