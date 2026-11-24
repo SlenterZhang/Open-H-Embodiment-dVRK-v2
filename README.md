@@ -22,8 +22,9 @@ the color image by the device. `meta.json` records `realsense.depth_scale`
 (metres per raw unit; zero is an invalid pixel) and the color intrinsics at
 recording time. Together these rebuild the exact colored point cloud of every
 frame offline (see [Point clouds](#point-clouds)), so clouds do not need to be
-stored. The LeRobot dataset gets the color video and the exact depth integers,
-not the intrinsics.
+stored. The LeRobot dataset gets the color video, the exact depth integers, and
+the depth scale and intrinsics in `info.json`, so it rebuilds the same clouds on
+its own.
 
 It then aligns both streams in time and writes them in the LeRobot format.
 
@@ -461,7 +462,7 @@ data/lerobot/needle_pick/
 | `observation.images.left` | video `[1080, 1920, 3]` | H.264, yuv420p, 30 fps |
 | `observation.images.right` | video `[1080, 1920, 3]` | H.264, yuv420p, 30 fps |
 | `observation.images.external` | video `[480, 640, 3]` by default | D435i color, re-encoded to H.264 yuv420p by `convert` |
-| `observation.depth.external` | float32 `[480, 640]` by default | Exact raw uint16 depth integers in Parquet; metres = value × `depth_scale_m_per_unit` |
+| `observation.depth.external` | float32 `[480, 640]` by default | Exact raw uint16 depth integers in Parquet; metres = value × `depth_scale_m_per_unit`. The feature's `info.intrinsics` (color camera, which depth is aligned to) back-projects it to a point cloud |
 | `timestamp` | float32 | `frame_index / fps` |
 | `frame_index` | int64 | `0..N-1` within the episode |
 | `episode_index` | int64 | episode number in the dataset |

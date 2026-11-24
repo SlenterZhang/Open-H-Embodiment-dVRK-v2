@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -40,7 +41,8 @@ class RGBDTests(unittest.TestCase):
         session = Session(
             root=Path("synthetic"),
             meta={"fps": 30, "task": "pick", "joint_names": {"PSM1": ["joint"]},
-                  "realsense": {"height": 2, "width": 2, "depth_scale": 0.001}},
+                  "realsense": {"height": 2, "width": 2, "depth_scale": 0.001,
+                                "color_intrinsics": {"fx": 1.0}}},
             robot=robot,
             frames={"left": left, "right": right, "external": external},
             videos={key: Path(f"{key}.mkv") for key in ("left", "right", "external")},
@@ -54,6 +56,7 @@ class RGBDTests(unittest.TestCase):
         self.assertEqual(episode.external, [0, 0, 1])  # slot 1 has no frameset: repeat
         self.assertEqual(episode.state.shape, (3, 9))
         self.assertEqual(episode.depth_shape, (2, 2))
+        self.assertEqual(episode.depth_intrinsics, {"fx": 1.0})
 
     def test_depth_parquet_preserves_every_uint16_value(self) -> None:
         images = [
@@ -125,6 +128,7 @@ class RGBDTests(unittest.TestCase):
             videos={side: Path(f"{side}.mkv") for side in ("left", "right", "external")},
             left=[0, 1], right=[0, 1], external=[0, 1],
             depth=Path("external_depth.mkv"), depth_scale=0.001, depth_shape=(16, 16),
+            depth_intrinsics={"width": 16, "height": 16, "fx": 600.0, "fy": 600.0, "ppx": 8.0, "ppy": 8.0},
             state_names=["PSM1.jp.joint"], notes=[],
         )
 
@@ -156,6 +160,8 @@ class RGBDTests(unittest.TestCase):
             ):
                 export_dataset([episode], config, output)
                 verify_dataset(output)
+            info = json.loads((output / "meta/info.json").read_text())
+            self.assertEqual(info["features"]["observation.depth.external"]["info"]["intrinsics"]["fx"], 600.0)
             table = pq.read_table(output / "data/chunk-000/episode_000000.parquet")
             self.assertEqual(table["observation.depth.external"].to_pylist(), [i.tolist() for i in images])
 

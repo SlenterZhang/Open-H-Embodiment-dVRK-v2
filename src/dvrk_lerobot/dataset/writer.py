@@ -49,9 +49,10 @@ def export_dataset(episodes: Sequence[Episode], config: AppConfig, output: Path)
             episode.external is None or len(episode.external) != len(episode.state)
             or episode.depth_shape != items[0].depth_shape
             or episode.depth_scale != items[0].depth_scale
+            or episode.depth_intrinsics != items[0].depth_intrinsics
             or episode.depth_shape != (config.realsense.height, config.realsense.width)
         ):
-            raise ExportError(f"{episode.session}: incompatible RGB-D shape, scale, or frame count")
+            raise ExportError(f"{episode.session}: incompatible RGB-D shape, scale, intrinsics, or frame count")
 
     destination = output.expanduser().absolute()
     partial = destination.with_name(destination.name + ".partial")
@@ -120,6 +121,7 @@ def export_dataset(episodes: Sequence[Episode], config: AppConfig, output: Path)
             names, video_info,
             depth_shape=items[0].depth_shape if has_depth else None,
             depth_scale=items[0].depth_scale if has_depth else None,
+            depth_intrinsics=items[0].depth_intrinsics if has_depth else None,
         )
         info = schema.info_dict(
             fps=config.dataset.fps,

@@ -38,6 +38,7 @@ def state_names(arms: Sequence[ArmConfig], joint_names: Mapping[str, Sequence[st
 def build_features(
     state_names_: Sequence[str], videos: Mapping[str, Mapping[str, Any]],
     depth_shape: tuple[int, int] | None = None, depth_scale: float | None = None,
+    depth_intrinsics: Mapping[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Return info.json features, with video features inserted before defaults."""
     names = list(state_names_)
@@ -76,6 +77,9 @@ def build_features(
                 "aligned_to": "observation.images.external",
             },
         }
+        if depth_intrinsics is not None:
+            # Depth is aligned to color, so the color intrinsics back-project it.
+            features["observation.depth.external"]["info"]["intrinsics"] = dict(depth_intrinsics)
     features.update({key: dict(value) for key, value in DEFAULT_FEATURES.items()})
     return features
 

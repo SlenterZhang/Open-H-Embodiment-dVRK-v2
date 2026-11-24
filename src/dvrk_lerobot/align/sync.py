@@ -44,6 +44,7 @@ class Episode:
     depth: Path | None = None
     depth_scale: float | None = None
     depth_shape: tuple[int, int] | None = None
+    depth_intrinsics: dict | None = None
 
 
 def align_session(session: Session, arms: Sequence[ArmConfig], options: AlignOptions) -> Episode:
@@ -106,6 +107,7 @@ def align_session(session: Session, arms: Sequence[ArmConfig], options: AlignOpt
         depth=session.depth if has_external else None,
         depth_scale=float(rs_info["depth_scale"]) if has_external else None,
         depth_shape=(int(rs_info["height"]), int(rs_info["width"])) if has_external else None,
+        depth_intrinsics=rs_info.get("color_intrinsics") if has_external else None,
     )
 
 
