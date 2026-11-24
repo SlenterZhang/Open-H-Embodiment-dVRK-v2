@@ -46,6 +46,8 @@ It then aligns both streams in time and writes them in the LeRobot format.
 | Convert | `./scripts/convert.sh --sessions ... --output ...` | Aligns robot data and video in time, writes the LeRobot dataset |
 | Verify | `uv run --no-sync dvrk-lerobot verify --dataset ...` | Checks the dataset structure |
 
+A step-by-step operator guide (recording day checklist, converting, using depth
+and point clouds, disk and RAM usage) is in [docs/MANUAL.md](docs/MANUAL.md).
 Design details (threading, timing model, file formats) are in
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -659,8 +661,9 @@ ffplay -f v4l2 -input_format mjpeg -video_size 1920x1080 -framerate 30 /dev/vide
 - **Software stereo sync.** Convert uses PC time after each frame is decoded.
   Driver timestamps are now logged for diagnostics. The recorder does not
   configure or verify hardware synchronization of the source or capture cards.
-- **No camera calibration.** Intrinsics, stereo extrinsics and
-  camera-to-robot registration are not stored.
+- **Partial camera calibration.** Only the D435i colour intrinsics are stored
+  (raw `meta.json` and the dataset's `info.json`). Endoscope intrinsics, stereo
+  extrinsics and camera-to-robot registration are not.
 - **Positions only.** Joint velocities, efforts and other CRTK topics are not
   recorded.
 - **One task per run.** All episodes of one `record` run share its `--task`.
