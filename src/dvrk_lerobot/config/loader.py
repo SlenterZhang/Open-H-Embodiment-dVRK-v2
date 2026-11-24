@@ -14,6 +14,7 @@ from dvrk_lerobot.config.model import (
     ArmConfig,
     CameraConfig,
     DatasetConfig,
+    RealSenseConfig,
 )
 
 X264_PRESETS = {
@@ -48,13 +49,14 @@ def load_config(path: str | Path) -> AppConfig:
 def parse_config(raw: Any) -> AppConfig:
     """Validate an already parsed YAML mapping."""
     root = _mapping(raw, "root")
-    _only(root, {"dataset", "arms", "cameras", "alignment"}, "root")
+    _only(root, {"dataset", "arms", "cameras", "realsense", "alignment"}, "root")
 
     dataset = _parse_dataset(_mapping(root.get("dataset"), "dataset"))
     arms = _parse_arms(root.get("arms"))
     cameras = _parse_cameras(root.get("cameras"), dataset.fps)
+    realsense = _parse_realsense(root.get("realsense"), dataset.fps)
     alignment = _parse_alignment(_mapping(root.get("alignment"), "alignment"))
-    return AppConfig(arms=arms, cameras=cameras, alignment=alignment, dataset=dataset)
+    return AppConfig(arms=arms, cameras=cameras, realsense=realsense, alignment=alignment, dataset=dataset)
 
 
 def _parse_dataset(raw: dict[str, Any]) -> DatasetConfig:
@@ -136,10 +138,41 @@ def _parse_cameras(raw: Any, fps: int) -> dict[str, CameraConfig]:
 
 
 def _parse_alignment(raw: dict[str, Any]) -> AlignmentConfig:
-    _only(raw, {"stereo_tolerance_ms", "robot_tolerance_ms"}, "alignment")
+    _only(raw, {"stereo_tolerance_ms", "external_tolerance_ms", "robot_tolerance_ms"}, "alignment")
     stereo = _number(raw.get("stereo_tolerance_ms"), "alignment.stereo_tolerance_ms", 0.0, 1000.0)
+    external = _number(raw.get("external_tolerance_ms", 25.0), "alignment.external_tolerance_ms", 0.0, 1000.0)
     robot = _number(raw.get("robot_tolerance_ms"), "alignment.robot_tolerance_ms", 0.0, 1000.0)
-    return AlignmentConfig(stereo_tolerance_ms=stereo, robot_tolerance_ms=robot)
+    return AlignmentConfig(
+        stereo_tolerance_ms=stereo, external_tolerance_ms=external, robot_tolerance_ms=robot
+    )
+
+
+def _parse_realsense(raw: Any, fps: int) -> RealSenseConfig | None:
+    if raw is None:
+        return None
+    item = _mapping(raw, "realsense")
+    _only(item, {"serial", "width", "height", "fps", "color_crf", "record_cloud"}, "realsense")
+    width = _integer(item.get("width"), "realsense.width", 16, 8192)
+    height = _integer(item.get("height"), "realsense.height", 16, 8192)
+    if width % 2 or height % 2:
+        raise ConfigError("realsense width and height must be even")
+    camera_fps = _integer(item.get("fps"), "realsense.fps", 1, 240)
+    if camera_fps != fps:
+        raise ConfigError("realsense.fps must equal dataset.fps")
+    serial = item.get("serial")
+    if serial is not None:
+        serial = _string(serial, "realsense.serial")
+    record_cloud = item.get("record_cloud", False)
+    if not isinstance(record_cloud, bool):
+        raise ConfigError("realsense.record_cloud must be a boolean")
+    return RealSenseConfig(
+        record_cloud=record_cloud,
+        serial=serial,
+        width=width,
+        height=height,
+        fps=camera_fps,
+        color_crf=_integer(item.get("color_crf", 18), "realsense.color_crf", 0, 51),
+    )
 
 
 def _mapping(value: Any, where: str) -> dict[str, Any]:

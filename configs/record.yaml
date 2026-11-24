@@ -42,10 +42,21 @@ cameras:
     fourcc: MJPG
     crf: 18
 
+# D435i color and depth share a frameset; depth is aligned to color.
+realsense:
+  serial: null
+  width: 640
+  height: 480
+  fps: 30
+  color_crf: 18
+  record_cloud: false  # Override with --record-cloud / --no-record-cloud.
+
 alignment:
   # These only set what `convert` reports; no frame is removed for exceeding them.
   # Report grid frames whose two eyes are further apart than this. The skew of
   # free-running cards is bounded by one slot (33 ms at 30 fps); 25 is 3/4 of a slot.
   stereo_tolerance_ms: 25.0
+  # Report grid frames whose RGB-D frameset is further than this from the left eye.
+  external_tolerance_ms: 25.0
   # Report grid frames whose held robot sample is older than this.
   robot_tolerance_ms: 25.0

@@ -26,7 +26,7 @@ def build_meta(
     camera_info: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     """Build the initial meta.json payload for one recording."""
-    return {
+    meta = {
         "session_id": f"{session_dir.parent.name}/{session_dir.name}",
         "created_ns": time.time_ns(),
         "task": task,
@@ -55,6 +55,21 @@ def build_meta(
             for side, camera in config.cameras.items()
         },
     }
+    if config.realsense is not None:
+        meta["realsense"] = {
+            "serial": camera_info["external"]["serial"],
+            "width": config.realsense.width,
+            "height": config.realsense.height,
+            "fps": config.realsense.fps,
+            "color_crf": config.realsense.color_crf,
+            "record_cloud": config.realsense.record_cloud,
+            "color_intrinsics": camera_info["external"].get("color_intrinsics"),
+            "depth_scale": camera_info["external"]["depth_scale"],
+            "depth_aligned_to_color": True,
+            "depth_invalid_value": 0,
+            "timestamp_source": "host_receive_time_ns",
+        }
+    return meta
 
 
 def check_cameras(info: dict[str, dict[str, Any]]) -> None:

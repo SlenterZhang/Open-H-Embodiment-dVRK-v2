@@ -8,6 +8,7 @@ from dvrk_lerobot.config.model import (
     ArmConfig,
     CameraConfig,
     DatasetConfig,
+    RealSenseConfig,
 )
 
 __all__ = [
@@ -18,6 +19,7 @@ __all__ = [
     "CameraConfig",
     "ConfigError",
     "DatasetConfig",
+    "RealSenseConfig",
     "load_config",
     "parse_config",
 ]

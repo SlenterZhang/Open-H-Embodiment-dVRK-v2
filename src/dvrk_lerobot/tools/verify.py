@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from dvrk_lerobot.dataset import schema, video
@@ -40,15 +41,35 @@ def verify_dataset(path: str | Path) -> dict[str, Any]:
     if list(features["action"]["names"]) != list(state_names):
         raise VerifyError("action names differ from observation.state")
     fps = int(info["fps"])
+    video_sides = [key.removeprefix("observation.images.") for key, ft in features.items() if ft["dtype"] == "video"]
+    depth_feature = features.get("observation.depth.external")
+    if depth_feature is not None:
+        details = depth_feature.get("info", {})
+        if details.get("representation") != "uint16_raw_as_float32" or details.get("depth_scale_m_per_unit", 0) <= 0:
+            raise VerifyError("depth representation or scale is missing")
+        if "external" not in video_sides:
+            raise VerifyError("depth requires the external RGB video")
     task_indices = {int(item["task_index"]) for item in tasks}
     total_frames = 0
     offset = 0
     for episode in episodes:
         index = int(episode["episode_index"])
         length = int(episode["length"])
-        table = pq.read_table(root / schema.data_path(index))
+        parquet_path = root / schema.data_path(index)
+        if depth_feature is not None:
+            depth_type = pq.ParquetFile(parquet_path).schema_arrow.field("observation.depth.external").type
+            height, width = depth_feature["shape"]
+            if not (
+                pa.types.is_fixed_size_list(depth_type) and depth_type.list_size == height
+                and pa.types.is_fixed_size_list(depth_type.value_type)
+                and depth_type.value_type.list_size == width
+                and depth_type.value_type.value_type == pa.float32()
+            ):
+                raise VerifyError(f"episode {index}: depth is not a float32 HxW array")
+        columns = ["observation.state", "action", "timestamp", "frame_index", "episode_index", "index", "task_index"]
+        table = pq.read_table(parquet_path, columns=columns)
         _check_table(table, index, length, offset, dimension, fps, task_indices)
-        for side in ("left", "right"):
+        for side in video_sides:
             relative = schema.video_path(index, side)
             video_path = root / relative
             if not video_path.is_file():
@@ -67,7 +88,7 @@ def verify_dataset(path: str | Path) -> dict[str, Any]:
         raise VerifyError("info.json total_episodes does not match episodes.jsonl")
     if len(tasks) != int(info["total_tasks"]):
         raise VerifyError("info.json total_tasks does not match tasks.jsonl")
-    if int(info["total_videos"]) != len(episodes) * 2:
+    if int(info["total_videos"]) != len(episodes) * len(video_sides):
         raise VerifyError("info.json total_videos is inconsistent")
     return {
         "root": str(root),

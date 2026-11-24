@@ -13,11 +13,16 @@ dependencies = [
     "opencv-python==4.10.0.84",
     "pyarrow>=14,<19",
     "PyYAML>=6,<7",
+    "pyrealsense2>=2.54,<3",
 ]
+
+[project.optional-dependencies]
+avp = ["aiohttp>=3.9,<4"]
 
 [project.scripts]
 dvrk-lerobot = "dvrk_lerobot.cli:main"
 dvrk-touchx = "dvrk_touchx.cli:main"
+dvrk-avp = "dvrk_avp.cli:main"
 
 [dependency-groups]
 dev = [
@@ -26,7 +31,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/dvrk_lerobot", "src/dvrk_touchx"]
+packages = ["src/dvrk_lerobot", "src/dvrk_touchx", "src/dvrk_avp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

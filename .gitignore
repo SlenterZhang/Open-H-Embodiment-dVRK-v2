@@ -236,3 +236,6 @@ output/
 .ros/
 .tmp/
 *.partial/
+
+# Self-signed TLS certificate for the Vision Pro viewer
+.certs/

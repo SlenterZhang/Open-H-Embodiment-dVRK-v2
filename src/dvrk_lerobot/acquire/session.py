@@ -9,6 +9,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
+from dvrk_lerobot.dataset.depth import probe as probe_depth
 from dvrk_lerobot.dataset.video import count_frames
 
 RAW_FORMAT = "dvrk-raw-v2"
@@ -43,6 +44,7 @@ class Session:
     robot: list[RobotSample]
     frames: dict[str, list[Frame]]
     videos: dict[str, Path]
+    depth: Path | None = None
 
     @property
     def task(self) -> str:
@@ -107,7 +109,7 @@ class RawSession:
             {
                 "status": status,
                 "ended_ns": int(ended_ns),
-                "frame_counts": {side: int(frame_counts.get(side, 0)) for side in SIDES},
+                "frame_counts": {side: int(frame_counts.get(side, 0)) for side in frame_counts},
                 "robot_counts": dict(self._counts),
                 "camera_info": camera_info,
                 "joint_names": joint_names,
@@ -138,7 +140,19 @@ def load_session(path: str | Path) -> Session:
     robot = _load_robot(root / "robot.jsonl", arms)
     frames = {side: _load_frames(*video_files(root, side)) for side in SIDES}
     videos = {side: video_files(root, side)[0] for side in SIDES}
-    return Session(root=root, meta=meta, robot=robot, frames=frames, videos=videos)
+    depth_path: Path | None = None
+    if "realsense" in meta:
+        depth_path = root / "video" / "external_depth.mkv"
+        depth_info = probe_depth(depth_path)
+        rs_info = meta["realsense"]
+        if (depth_info["width"], depth_info["height"]) != (rs_info["width"], rs_info["height"]):
+            raise ValueError(f"{depth_path}: depth dimensions disagree with metadata")
+        frames["external"] = _load_frames(*video_files(root, "external"))
+        frames["external"] = frames["external"][:count_frames(depth_path)]
+        if not frames["external"]:
+            raise ValueError(f"{root}: no common RGB-D frames")
+        videos["external"] = video_files(root, "external")[0]
+    return Session(root=root, meta=meta, robot=robot, frames=frames, videos=videos, depth=depth_path)
 
 
 def video_files(root: Path, side: str) -> tuple[Path, Path]:

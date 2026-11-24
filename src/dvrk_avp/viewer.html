@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dVRK stereo viewer</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font: 16px system-ui, sans-serif; text-align: center; }
+  button { font-size: 24px; padding: 16px 40px; margin: 20px; border-radius: 12px; }
+  #preview { width: 96vw; background: #000; }
+</style>
+</head>
+<body>
+<button id="enter" disabled>Checking WebXR…</button>
+<div id="status">connecting…</div>
+<canvas id="preview"></canvas>
+<script>
+// Query options: ?dist=<metres to the virtual screen>&size=<screen width in metres>
+const params = new URLSearchParams(location.search);
+const DIST = parseFloat(params.get("dist") || "1.0");
+const SIZE = parseFloat(params.get("size") || "1.0");
+
+const enterBtn = document.getElementById("enter");
+const statusEl = document.getElementById("status");
+const preview = document.getElementById("preview");
+let eyes = [null, null];     // latest ImageBitmap for [left, right]
+let dirty = false;           // new eyes not yet uploaded to the GPU
+let session = null;
+let frames = 0, fpsStamp = performance.now();
+
+// ---- Frame stream: [uint32 left length][left JPEG][right JPEG], ack each with "ok".
+function connect() {
+  const ws = new WebSocket(`wss://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => (statusEl.textContent = "connected");
+  ws.onclose = () => { statusEl.textContent = "disconnected, retrying…"; setTimeout(connect, 1000); };
+  ws.onmessage = async (ev) => {
+    const buf = ev.data;
+    const n = new DataView(buf).getUint32(0, true);
+    const decoded = await Promise.all([
+      createImageBitmap(new Blob([new Uint8Array(buf, 4, n)], { type: "image/jpeg" })),
+      createImageBitmap(new Blob([new Uint8Array(buf, 4 + n)], { type: "image/jpeg" })),
+    ]);
+    eyes.forEach((bmp) => bmp && bmp.close());
+    eyes = decoded;
+    dirty = true;
+    ws.send("ok");
+    if (!session) drawPreview();
+    countFps();
+  };
+}
+
+function countFps() {
+  frames++;
+  const now = performance.now();
+  if (now - fpsStamp >= 1000) {
+    statusEl.textContent = `${frames} fps, ${eyes[0].width}x${eyes[0].height} per eye`;
+    frames = 0; fpsStamp = now;
+  }
+}
+
+function drawPreview() {
+  const [l, r] = eyes;
+  preview.width = l.width + r.width; preview.height = l.height;
+  const ctx = preview.getContext("2d");
+  ctx.drawImage(l, 0, 0); ctx.drawImage(r, l.width, 0);
+}
+
+// ---- WebGL: one textured quad per eye, placed DIST metres in front of the head.
+const glCanvas = document.createElement("canvas");
+const gl = glCanvas.getContext("webgl2", { xrCompatible: true });
+const VS = `#version 300 es
+in vec2 p; uniform mat4 mvp; out vec2 uv;
+void main() { uv = vec2((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5); gl_Position = mvp * vec4(p, 0.0, 1.0); }`;
+const FS = `#version 300 es
+precision mediump float; in vec2 uv; uniform sampler2D tex; out vec4 color;
+void main() { color = texture(tex, uv); }`;
+
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+const mvpLoc = gl.getUniformLocation(prog, "mvp");
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+const pLoc = gl.getAttribLocation(prog, "p");
+gl.enableVertexAttribArray(pLoc);
+gl.vertexAttribPointer(pLoc, 2, gl.FLOAT, false, 0, 0);
+const textures = [0, 1].map(() => {
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+});
+
+// Column-major 4x4 product a * b.
+function mul(a, b) {
+  const out = new Float32Array(16);
+  for (let c = 0; c < 4; c++)
+    for (let r = 0; r < 4; r++)
+      for (let k = 0; k < 4; k++) out[c * 4 + r] += a[k * 4 + r] * b[c * 4 + k];
+  return out;
+}
+
+function onXRFrame(_, frame) {
+  session.requestAnimationFrame(onXRFrame);
+  const pose = frame.getViewerPose(refSpace);
+  const layer = session.renderState.baseLayer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  if (!pose || !eyes[0]) return;
+  if (dirty) {
+    eyes.forEach((bmp, i) => {
+      gl.bindTexture(gl.TEXTURE_2D, textures[i]);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
+    });
+    dirty = false;
+  }
+  // Head-locked screen: SIZE wide, DIST ahead of the head centre, eyes converge on it.
+  const sx = SIZE / 2, sy = sx * eyes[0].height / eyes[0].width;
+  const screen = mul(pose.transform.matrix,
+    new Float32Array([sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, 1, 0, 0, 0, -DIST, 1]));
+  gl.useProgram(prog);
+  gl.bindVertexArray(vao);
+  for (const view of pose.views) {
+    const vp = layer.getViewport(view);
+    gl.viewport(vp.x, vp.y, vp.width, vp.height);
+    gl.bindTexture(gl.TEXTURE_2D, textures[view.eye === "right" ? 1 : 0]);
+    const mvp = mul(view.projectionMatrix, mul(view.transform.inverse.matrix, screen));
+    gl.uniformMatrix4fv(mvpLoc, false, mvp);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+}
+
+let refSpace = null;
+async function enterXR() {
+  session = await navigator.xr.requestSession("immersive-vr");
+  session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+  refSpace = await session.requestReferenceSpace("local");
+  session.addEventListener("end", () => { session = null; enterBtn.textContent = "Enter stereo view"; });
+  enterBtn.textContent = "In headset";
+  session.requestAnimationFrame(onXRFrame);
+}
+
+(async () => {
+  if (navigator.xr && await navigator.xr.isSessionSupported("immersive-vr")) {
+    enterBtn.disabled = false;
+    enterBtn.textContent = "Enter stereo view";
+    enterBtn.onclick = () => enterXR().catch((e) => (statusEl.textContent = `XR error: ${e}`));
+  } else {
+    enterBtn.textContent = "WebXR not available (preview only)";
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from dvrk_lerobot.acquire.session import load_session
@@ -41,8 +42,11 @@ def main(argv: list[str] | None = None) -> int:
 def _record(args: argparse.Namespace) -> int:
     from dvrk_lerobot.acquire.recorder import run_record
 
-    config = load_config(args.config)
-    paths = run_record(config, Path(args.root), task=args.task, notes=args.notes)
+    config = _acquisition_config(args)
+    paths = run_record(
+        config, Path(args.root), task=args.task, notes=args.notes,
+        resume_run=Path(args.resume_run) if args.resume_run else None,
+    )
     print(f"recorded {len(paths)} episode(s)")
     for path in paths:
         print(f"raw session: {path}")
@@ -50,11 +54,13 @@ def _record(args: argparse.Namespace) -> int:
 
 
 def _convert(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
+    config = _acquisition_config(args)
     options = AlignOptions(
         fps=config.dataset.fps,
         stereo_tolerance_ms=config.alignment.stereo_tolerance_ms,
         robot_tolerance_ms=config.alignment.robot_tolerance_ms,
+        external_tolerance_ms=config.alignment.external_tolerance_ms,
+        require_external=config.realsense is not None,
     )
     episodes = []
     for path, from_run in _session_paths(args.sessions):
@@ -101,8 +107,20 @@ def _verify(args: argparse.Namespace) -> int:
 
 
 def _doctor(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
+    config = _acquisition_config(args)
     return 0 if run_doctor(config, topic_timeout=args.topics_timeout) else 1
+
+
+def _acquisition_config(args: argparse.Namespace):
+    config = load_config(args.config)
+    cloud = getattr(args, "record_cloud", None)
+    if args.no_realsense:
+        config = replace(config, realsense=None)
+    if cloud is True and config.realsense is None:
+        raise ConfigError("--record-cloud requires RealSense; remove --no-realsense")
+    if cloud is not None and config.realsense is not None:
+        config = replace(config, realsense=replace(config.realsense, record_cloud=cloud))
+    return config
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -116,7 +134,13 @@ def _parser() -> argparse.ArgumentParser:
         "record", help="record episodes interactively: s = start, e = end, q = quit"
     )
     _config_argument(record)
+    _realsense_argument(record)
+    record.add_argument(
+        "--record-cloud", action=argparse.BooleanOptionalAction, default=None,
+        help="save a colored PLY per RGB-D frame (default: YAML setting, off)",
+    )
     record.add_argument("--root", default="data/raw", help="raw session root directory")
+    record.add_argument("--resume-run", help="append episodes to an existing run directory")
     record.add_argument("--task", required=True, help="task description stored in metadata")
     record.add_argument("--notes", default="", help="optional free-form notes")
 
@@ -124,6 +148,7 @@ def _parser() -> argparse.ArgumentParser:
         "convert", help="align raw episodes in time and convert them to LeRobot v2.1"
     )
     _config_argument(convert)
+    _realsense_argument(convert)
     convert.add_argument(
         "--sessions", nargs="+", required=True, help="run directories and/or episode directories"
     )
@@ -145,6 +170,7 @@ def _parser() -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser("doctor", help="check tools, cameras, and topics")
     _config_argument(doctor)
+    _realsense_argument(doctor)
     doctor.add_argument(
         "--topics-timeout", type=float, default=5.0, help="seconds to listen for each topic set"
     )
@@ -154,6 +180,13 @@ def _parser() -> argparse.ArgumentParser:
 def _config_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "-c", "--config", default="configs/record.yaml", help="YAML configuration path"
+    )
+
+
+def _realsense_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--no-realsense", action="store_true",
+        help="skip RealSense for this run, even if configured in YAML",
     )
 
 

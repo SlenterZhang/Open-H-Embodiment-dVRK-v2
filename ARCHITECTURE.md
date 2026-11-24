@@ -4,13 +4,21 @@ This document explains how the acquisition and export pipeline is organised,
 why it is split into two stages, and how timestamps become a LeRobot Dataset
 v2.1 episode.
 
+The original sections below describe the stereo-only base pipeline. The RGB-D
+extension adds one D435i frameset stream (`acquire/realsense.py`), storing color
+as H.264 and color-aligned uint16 depth as lossless FFV1. `align/sync.py`
+matches each stereo pair to one RGB-D frameset, and `dataset/writer.py` writes
+`observation.images.external` plus exact depth integers in the float32
+`observation.depth.external` Parquet array. See `README.md` for the current
+configuration and data layout.
+
 ## 1. Goals and non-goals
 
 ### Goals
 
 - Record dVRK `measured_js` (joint positions) and `measured_cp` (Cartesian
   pose) from ROS 2 Humble.
-- Record two V4L2 camera streams from `/dev/video0` and `/dev/video2`.
+- Record two configured V4L2 camera streams and optional D435i RGB-D framesets.
 - Preserve enough timing information to align the streams offline.
 - Export a self-contained LeRobot Dataset v2.1 with parquet, MP4, and metadata.
 - Fail visibly: no silent topic substitution or resizing. A grid slot that no
@@ -44,14 +52,16 @@ LeRobot dataset from it:
 flowchart LR
     JS["/PSM1/measured_js<br/>sensor_msgs/JointState"] --> N[RecorderNode]
     CP["/PSM1/measured_cp<br/>geometry_msgs/PoseStamped"] --> N
-    L["/dev/video0"] --> LC[Camera thread left]
-    R["/dev/video2"] --> RC[Camera thread right]
+    L["configured left device"] --> LC[Camera thread left]
+    R["configured right device"] --> RC[Camera thread right]
+    RGBD["D435i color + depth"] --> EC[RGB-D thread]
     N --> S[(Raw session<br/>robot.jsonl)]
     LC --> S
     RC --> S
+    EC --> S
     S --> A[Aligner]
     A --> W[LeRobot v2.1 writer]
-    W --> D[(parquet + MP4 + meta)]
+    W --> D[(parquet + MP4 + depth + meta)]
 ```
 
 Benefits:
